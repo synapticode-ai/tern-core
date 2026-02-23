@@ -185,6 +185,10 @@ class TernaryLinearAccel(TernaryLinear):
 
         Falls back to PyTorch if the C library is unavailable or
         the input dimension is not aligned for packed format.
+
+        Handles arbitrary leading dimensions (e.g., (batch, seq_len, features)
+        from transformer models) by flattening to 2D for the C kernel, then
+        restoring the original shape.
         """
         if _lib is None or self.in_features % 4 != 0:
             return super()._forward_eval(x)
@@ -196,6 +200,11 @@ class TernaryLinearAccel(TernaryLinear):
         # Ensure packed weights are cached
         if self._packed_weights_np is None:
             self._cache_accel_weights()
+
+        # Save original shape and flatten leading dims to 2D
+        orig_shape = x.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, x.shape[-1])
 
         # Prepare input: float32, contiguous, on CPU
         x_np = x.detach().cpu().float().contiguous().numpy()
@@ -245,6 +254,10 @@ class TernaryLinearAccel(TernaryLinear):
         result = torch.from_numpy(output_np.copy())
         if squeeze:
             result = result.squeeze(0)
+
+        # Restore leading dimensions
+        if len(orig_shape) > 2:
+            result = result.reshape(*orig_shape[:-1], M)
 
         return result
 
