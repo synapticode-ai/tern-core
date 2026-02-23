@@ -188,8 +188,8 @@ class TernModelWriter:
             f.write(weight_bytes)
             f.write(fp16_bytes)
 
-            # Checksum (of everything before checksum)
-            f.seek(0)
+        # Checksum (of everything before checksum)
+        with open(path, "rb") as f:
             content = f.read()
 
         # Append checksum
