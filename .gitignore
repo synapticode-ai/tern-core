@@ -14,3 +14,12 @@ build/
 venv/
 wandb/
 *.log
+
+# C build artifacts
+*.o
+*.so
+*.dylib
+src/terncore/csrc/test_matmul
+src/terncore/csrc/test_packed
+src/terncore/csrc/test_simd
+src/terncore/csrc/test_sparse_skip
