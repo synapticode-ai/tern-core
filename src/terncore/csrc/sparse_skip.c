@@ -29,6 +29,10 @@
 #include "sparse_skip.h"
 #include <string.h>   /* memcpy */
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* ─────────────────────────────────────────────────────────────────────
  * Portable count-trailing-zeros for uint64.
  *
@@ -106,6 +110,7 @@ int tern_sparse64_matvec_f32(
     const size_t total = (size_t)M * (size_t)N;
     const size_t bitmap_bytes = (total + 7) >> 3;
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < M; i++) {
         float acc = 0.0f;
         const size_t row_start = (size_t)i * (size_t)N;
@@ -215,6 +220,7 @@ int tern_sparse64_packed_matvec_f32(
     const size_t total = (size_t)M * (size_t)N;
     const size_t bitmap_bytes = (total + 7) >> 3;
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < M; i++) {
         float acc = 0.0f;
         const size_t row_start = (size_t)i * (size_t)N;

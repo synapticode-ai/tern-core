@@ -31,6 +31,10 @@
 
 #include <arm_neon.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* ── Trit-to-mask lookup tables ──────────────────────────────────────
  *
  * Same as AVX2 variant: for each packed byte, precompute which of
@@ -117,6 +121,7 @@ int tern_packed_matvec_f32_neon(
     const int packed_cols = N >> 2;
     const float32x4_t zero_v = vdupq_n_f32(0.0f);
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < M; i++) {
         float acc = 0.0f;
         const uint8_t *row = packed + (size_t)i * (size_t)packed_cols;

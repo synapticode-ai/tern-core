@@ -30,6 +30,16 @@ extern "C" {
 /* ── Dispatch and detection (bindings.c) ─────────────────────────── */
 
 uint32_t get_simd_support(void);
+const char *terncore_version(void);
+
+int ternary_matmul_f32(
+    const uint8_t *packed_weights,
+    const float   *input,
+    float         *output,
+    const uint8_t *bitmap,
+    float          alpha,
+    const float   *bias,
+    int M, int N, int B);
 
 int ternary_matmul_f32_simd(
     const uint8_t *packed_weights,

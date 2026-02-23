@@ -32,6 +32,10 @@
 
 #include <immintrin.h>   /* AVX2 intrinsics */
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* ── Trit-to-mask lookup tables ──────────────────────────────────────
  *
  * For each possible packed byte (0-255), precompute which of the
@@ -106,6 +110,7 @@ int tern_packed_matvec_f32_avx2(
         1 << 3, 1 << 2, 1 << 1, 1 << 0);
     const __m256  zero_v  = _mm256_setzero_ps();
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < M; i++) {
         float acc = 0.0f;
         const uint8_t *row = packed + (size_t)i * (size_t)packed_cols;
@@ -114,6 +119,10 @@ int tern_packed_matvec_f32_avx2(
         for (int s = 0; s < simd_pairs; s++, p += 2) {
             uint8_t b0 = row[p];
             uint8_t b1 = row[p + 1];
+
+            /* Prefetch next packed weight chunk (Patent 40) */
+            if (s + 1 < simd_pairs)
+                _mm_prefetch((const char *)&row[p + 2], _MM_HINT_T0);
 
             /* 8-weight block zero-skip (Patent 37) */
             if ((b0 | b1) == 0) continue;
@@ -149,8 +158,8 @@ int tern_packed_matvec_f32_avx2(
              * order exactly.  The SIMD benefit comes from the branchless
              * mask-and-blend above, not from parallel accumulation.
              */
-            float tmp[8] __attribute__((aligned(32)));
-            _mm256_store_ps(tmp, result);
+            float tmp[8];
+            _mm256_storeu_ps(tmp, result);
             acc += tmp[0]; acc += tmp[1]; acc += tmp[2]; acc += tmp[3];
             acc += tmp[4]; acc += tmp[5]; acc += tmp[6]; acc += tmp[7];
         }

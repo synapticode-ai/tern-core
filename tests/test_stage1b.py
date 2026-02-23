@@ -191,7 +191,13 @@ class TestTernaryLinearAccel:
     def test_extra_repr(self):
         """String representation reports acceleration status."""
         layer = TernaryLinearAccel(64, 32)
-        assert "accel=C" in layer.extra_repr()
+        repr_str = layer.extra_repr()
+        assert "accel=" in repr_str
+        # Accept any C backend label (torch_ext, ctypes, or legacy "C")
+        assert any(
+            label in repr_str
+            for label in ("accel=torch_ext", "accel=ctypes", "accel=C")
+        )
 
 
 # ═══════════════════════════════════════════════════════════════

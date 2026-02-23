@@ -37,6 +37,10 @@
 
 #include "ternary_packed.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* decode_byte_f32 is defined in ternary_packed.h for reuse by SIMD kernels */
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -67,6 +71,7 @@ int tern_packed_matvec_f32(
 
     const int packed_cols = N >> 2;   /* N / 4 packed bytes per row */
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < M; i++) {
         float acc = 0.0f;
         const uint8_t *row = packed + (size_t)i * (size_t)packed_cols;
@@ -162,6 +167,7 @@ int tern_packed_matvec_f32_sparse(
 
     const int packed_cols = N >> 2;
 
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < M; i++) {
         float acc = 0.0f;
         const size_t row_start = (size_t)i * (size_t)N;

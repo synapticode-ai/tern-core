@@ -1,10 +1,19 @@
 """
-Accelerated ternary linear layer using C kernels via ctypes.
+Accelerated ternary linear layer using C kernels.
 
 Provides TernaryLinearAccel as a drop-in replacement for TernaryLinear.
 When the compiled C library (libterncore) is available, eval-mode
 forward passes use optimised C kernels with 2-bit packed weights and
-bitmap-driven zero-skip.  Falls back to pure PyTorch otherwise.
+bitmap-driven zero-skip.
+
+Two acceleration backends are tried in order:
+  1. PyTorch C++ extension (torch.utils.cpp_extension) — zero-copy,
+     passes tensor data pointers directly to C kernels.  JIT-compiled
+     on first import.  (Phase 4: ~100-200us overhead eliminated.)
+  2. ctypes fallback — loads the pre-built shared library and marshals
+     data through numpy.
+
+Falls back to pure PyTorch if neither backend is available.
 
 Patent 37: Zero-weight clock-gating — sparsity-aware skip logic.
 Patent 38: Configurable precision — dual-path dispatch.
@@ -16,7 +25,10 @@ Copyright (c) 2025 Synapticode Co., Ltd. All rights reserved.
 from __future__ import annotations
 
 import ctypes
+import logging
+import os
 import platform
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +38,8 @@ import torch
 from terncore.arithmetic.linear import TernaryLinear
 from terncore.sparse import pack_ternary_weights
 
+logger = logging.getLogger(__name__)
+
 
 # ═══════════════════════════════════════════════════════════════
 # Library loading
@@ -33,6 +47,7 @@ from terncore.sparse import pack_ternary_weights
 
 _lib: Optional[ctypes.CDLL] = None
 _lib_path: Optional[Path] = None
+_torch_ext = None  # torch C++ extension module (preferred backend)
 
 
 def _setup_signatures(lib: ctypes.CDLL) -> None:
@@ -98,6 +113,114 @@ def _load_library() -> None:
                 continue
 
 
+def _get_omp_flags():
+    """Detect OpenMP flags for the torch extension.
+
+    On macOS, prefer PyTorch's own libiomp5 to avoid dual-libomp
+    conflicts.  Falls back to brew libomp if torch's copy isn't found.
+    On Linux, use the system's -fopenmp.
+    """
+    extra_cflags = []
+    extra_ldflags = []
+
+    if platform.system() == "Darwin":
+        # Need omp.h from brew for compilation, but must link against
+        # torch's own libiomp5 to avoid dual-libomp segfault.
+        omp_include = None
+        try:
+            omp_prefix = subprocess.check_output(
+                ["brew", "--prefix", "libomp"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            omp_inc = os.path.join(omp_prefix, "include")
+            if os.path.isfile(os.path.join(omp_inc, "omp.h")):
+                omp_include = omp_inc
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+        if omp_include is None:
+            return extra_cflags, extra_ldflags
+
+        extra_cflags = [
+            "-Xpreprocessor",
+            "-fopenmp",
+            f"-I{omp_include}",
+        ]
+
+        # Don't link against any libomp/libiomp5 directly — this avoids
+        # dual-initialization crashes.  OpenMP symbols are resolved at
+        # runtime from torch's already-loaded libiomp5 via dynamic lookup.
+        extra_ldflags = ["-undefined", "dynamic_lookup"]
+    else:
+        extra_cflags = ["-fopenmp"]
+        extra_ldflags = ["-fopenmp"]
+
+    return extra_cflags, extra_ldflags
+
+
+def _load_torch_extension() -> None:
+    """JIT-compile the PyTorch C++ extension for zero-copy kernel calls."""
+    global _torch_ext
+
+    try:
+        from torch.utils.cpp_extension import load
+    except ImportError:
+        return
+
+    csrc_dir = Path(__file__).resolve().parent.parent / "csrc"
+    cpp_file = csrc_dir / "torch_bindings.cpp"
+
+    if not cpp_file.exists():
+        return
+
+    # Collect all C source files needed by the extension
+    c_sources = [
+        "ternary_matmul.c",
+        "ternary_packed.c",
+        "sparse_skip.c",
+        "bindings.c",
+        "ternary_avx2.c",
+        "ternary_neon.c",
+    ]
+    sources = [str(cpp_file)]
+    for name in c_sources:
+        p = csrc_dir / name
+        if p.exists():
+            sources.append(str(p))
+
+    # Build flags — include csrc dir for header resolution
+    # Note: no -std=c11 since extra_cflags applies to both C and C++ files
+    extra_cflags = ["-O2", f"-I{csrc_dir}"]
+    extra_ldflags = []
+
+    # Architecture-specific SIMD flags
+    import struct
+    if struct.calcsize("P") * 8 == 64:
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64"):
+            extra_cflags.append("-mavx2")
+
+    # OpenMP flags
+    omp_cflags, omp_ldflags = _get_omp_flags()
+    extra_cflags.extend(omp_cflags)
+    extra_ldflags.extend(omp_ldflags)
+
+    try:
+        _torch_ext = load(
+            name="terncore_ext",
+            sources=sources,
+            extra_cflags=extra_cflags,
+            extra_ldflags=extra_ldflags,
+            verbose=False,
+        )
+        logger.info("Loaded terncore PyTorch C++ extension (zero-copy)")
+    except Exception as e:
+        logger.debug("Failed to load torch C++ extension: %s", e)
+        _torch_ext = None
+
+
+# Load backends: try torch extension first, then ctypes fallback
+_load_torch_extension()
 _load_library()
 
 
@@ -107,8 +230,8 @@ _load_library()
 
 
 def is_accelerated() -> bool:
-    """Return True if the C kernels are loaded and available."""
-    return _lib is not None
+    """Return True if C kernels are available (torch ext or ctypes)."""
+    return _torch_ext is not None or _lib is not None
 
 
 def get_acceleration_info() -> dict:
@@ -121,15 +244,28 @@ def get_acceleration_info() -> dict:
             library_path: str or None — path to loaded library
             simd_support: dict — available SIMD instruction sets
             version:      str or None — library version string
+            backend:      str — "torch_ext", "ctypes", or "none"
     """
     info: dict = {
-        "accelerated": _lib is not None,
+        "accelerated": is_accelerated(),
         "library_path": str(_lib_path) if _lib_path else None,
         "simd_support": {},
         "version": None,
+        "backend": "none",
     }
 
-    if _lib is not None:
+    if _torch_ext is not None:
+        info["backend"] = "torch_ext"
+        caps = _torch_ext.get_simd_support()
+        info["simd_support"] = {
+            "scalar": bool(caps & 0x01),
+            "avx2": bool(caps & 0x02),
+            "avx512": bool(caps & 0x04),
+            "neon": bool(caps & 0x08),
+        }
+        info["version"] = _torch_ext.terncore_version()
+    elif _lib is not None:
+        info["backend"] = "ctypes"
         caps = _lib.get_simd_support()
         info["simd_support"] = {
             "scalar": bool(caps & 0x01),
@@ -161,6 +297,11 @@ class TernaryLinearAccel(TernaryLinear):
 
     Training mode uses the same STE forward pass as TernaryLinear.
 
+    Two backends are supported (tried in order):
+      1. PyTorch C++ extension — zero-copy, passes tensor data_ptr
+         directly to C kernels.  Packed weights stored as torch tensors.
+      2. ctypes — marshals through numpy.  ~100-200us fixed overhead.
+
     Patent 37: Zero-skip via sparsity bitmap.
     Patent 38: Dual-path dispatch (C kernel / PyTorch fallback).
     Patent 39: 2-bit packed trit storage.
@@ -174,9 +315,13 @@ class TernaryLinearAccel(TernaryLinear):
         threshold: float = 0.7,
     ) -> None:
         super().__init__(in_features, out_features, bias, threshold)
-        # Cached numpy arrays for C kernel
+        # Cached packed data — stored as torch tensors for zero-copy path,
+        # also kept as numpy arrays for ctypes fallback
         self._packed_weights_np: Optional[np.ndarray] = None
         self._bitmap_np: Optional[np.ndarray] = None
+        self._packed_weights_t: Optional[torch.Tensor] = None
+        self._bitmap_t: Optional[torch.Tensor] = None
+        self._bias_t: Optional[torch.Tensor] = None
         self._alpha_val: float = 0.0
 
     def _forward_eval(self, x: torch.Tensor) -> torch.Tensor:
@@ -190,7 +335,7 @@ class TernaryLinearAccel(TernaryLinear):
         from transformer models) by flattening to 2D for the C kernel, then
         restoring the original shape.
         """
-        if _lib is None or self.in_features % 4 != 0:
+        if not is_accelerated() or self.in_features % 4 != 0:
             return super()._forward_eval(x)
 
         # Ensure ternary weights are cached
@@ -206,6 +351,53 @@ class TernaryLinearAccel(TernaryLinear):
         if x.ndim > 2:
             x = x.reshape(-1, x.shape[-1])
 
+        M = self.out_features
+        N = self.in_features
+
+        # ── Backend 1: torch C++ extension (zero-copy) ──────────
+        if _torch_ext is not None and self._packed_weights_t is not None:
+            # Ensure input is float32 contiguous on CPU
+            x_in = x.detach().cpu().float().contiguous()
+
+            # Handle 1D input (single sample)
+            squeeze = False
+            if x_in.ndim == 1:
+                x_in = x_in.unsqueeze(0)
+                squeeze = True
+
+            result = _torch_ext.ternary_forward(
+                self._packed_weights_t,
+                x_in,
+                self._bitmap_t,
+                self._alpha_val,
+                self._bias_t,
+                M,
+                N,
+            )
+
+            if squeeze:
+                result = result.squeeze(0)
+
+            # Restore leading dimensions
+            if len(orig_shape) > 2:
+                result = result.reshape(*orig_shape[:-1], M)
+
+            return result
+
+        # ── Backend 2: ctypes fallback ──────────────────────────
+        return self._forward_eval_ctypes(x, orig_shape, M, N)
+
+    def _forward_eval_ctypes(
+        self,
+        x: torch.Tensor,
+        orig_shape: torch.Size,
+        M: int,
+        N: int,
+    ) -> torch.Tensor:
+        """Ctypes-based eval forward (legacy path)."""
+        if _lib is None:
+            return super()._forward_eval(x)
+
         # Prepare input: float32, contiguous, on CPU
         x_np = x.detach().cpu().float().contiguous().numpy()
 
@@ -218,8 +410,6 @@ class TernaryLinearAccel(TernaryLinear):
         x_np = np.ascontiguousarray(x_np, dtype=np.float32)
 
         B = x_np.shape[0]
-        M = self.out_features
-        N = self.in_features
 
         # Allocate output
         output_np = np.zeros((B, M), dtype=np.float32)
@@ -281,11 +471,28 @@ class TernaryLinearAccel(TernaryLinear):
         # Cache alpha scalar
         self._alpha_val = self._cached_alpha.item()
 
+        # Build torch tensor versions for zero-copy path
+        self._packed_weights_t = torch.from_numpy(
+            self._packed_weights_np.copy()
+        ).contiguous()
+        self._bitmap_t = torch.from_numpy(
+            self._bitmap_np.copy()
+        ).contiguous()
+
+        # Cache bias as contiguous float32 tensor (or empty tensor)
+        if self.bias is not None:
+            self._bias_t = self.bias.detach().cpu().float().contiguous()
+        else:
+            self._bias_t = torch.empty(0, dtype=torch.float32)
+
     def invalidate_cache(self) -> None:
         """Clear all cached weights including packed C kernel data."""
         super().invalidate_cache()
         self._packed_weights_np = None
         self._bitmap_np = None
+        self._packed_weights_t = None
+        self._bitmap_t = None
+        self._bias_t = None
         self._alpha_val = 0.0
 
     @classmethod
@@ -318,8 +525,10 @@ class TernaryLinearAccel(TernaryLinear):
 
     def extra_repr(self) -> str:
         s = super().extra_repr()
-        if _lib is not None:
-            s += ", accel=C"
+        if _torch_ext is not None:
+            s += ", accel=torch_ext"
+        elif _lib is not None:
+            s += ", accel=ctypes"
         else:
             s += ", accel=fallback"
         return s
