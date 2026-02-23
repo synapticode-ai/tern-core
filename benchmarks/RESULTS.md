@@ -1,8 +1,8 @@
-# Stage 1B Benchmark Results
+# Benchmark Results
 
-Microbenchmark comparing **TernaryLinearAccel** (C + AVX2 SIMD) against
-**TernaryLinear** (pure PyTorch / BLAS) across four matrix sizes at ~65%
-ternary weight sparsity.
+Microbenchmark and end-to-end results for the ternary inference engine,
+comparing **TernaryLinearAccel** (C + AVX2 SIMD) against **TernaryLinear**
+(pure PyTorch / BLAS).
 
 ## System Information
 
@@ -178,6 +178,71 @@ chunk.
 **Impact**: Minor (~5-10%) improvement in cache hit rate for the packed
 weight stream.
 
+## TinyLlama-1.1B End-to-End Benchmark
+
+Full-model benchmark using **TinyLlama/TinyLlama-1.1B-Chat-v1.0** from
+HuggingFace.  Measures prefill latency, per-token decode speed, and
+memory across three phases: FP32 baseline, ternary PyTorch, and ternary
+C+SIMD accelerated.
+
+### Configuration
+
+- **Model**: TinyLlama-1.1B-Chat-v1.0 (LlamaForCausalLM)
+- **Parameters**: 1,100,048,384 (155 Linear layers, 154 eligible, 1 protected)
+- **Prompt**: "What is ternary computing? Explain in simple terms"
+- **Max tokens**: 50 (greedy decoding, `do_sample=False` for determinism)
+- **Quantisation threshold**: 0.7, no sensitivity analysis
+- **Protected layers**: lm_head (kept in FP16)
+
+### Latency
+
+| Phase | Memory (MB) | Compression | Prefill (ms) | Total (ms) | Per Token (ms) | Tok/s |
+|-------|-------------|-------------|-------------|------------|---------------|-------|
+| FP32 baseline | 4,196 | 1.0x | 3,693 | 9,095 | 108.0 | 5.5 |
+| Ternary PyTorch | 4,196 | 4.2x | 15,679 | 44,795 | 582.3 | 1.1 |
+| Ternary C+SIMD | 8,816 | 4.2x | 18,393 | 36,720 | **366.5** | **1.4** |
+
+### Key Observations
+
+**1. C+SIMD is 1.6x faster than PyTorch ternary per-token**
+
+The accelerated kernel reduces per-token decode from 582 ms to 367 ms
+(1.59x speedup).  Total generation time drops from 44.8s to 36.7s.
+This improvement comes from the zero-copy torch extension and OpenMP
+multi-threading across 154 linear layers per forward pass.
+
+**2. Still slower than FP32 BLAS (5.4x slower per-token)**
+
+The ternary kernel processes each layer's 2048x2048 matmul at ~2.45x
+faster than BLAS (per the microbenchmark), but this advantage is offset
+by:
+- Sequential accumulation constraint (bit-identical determinism)
+- 154 serial kernel calls per forward pass (no layer fusion)
+- The 512x512 layers (q/k/v projections, 2048x512) where BLAS is faster
+
+**3. Memory: runtime uses FP32 cached ternary weights**
+
+The 4.2x compression ratio reflects theoretical packed storage (2-bit +
+bitmap).  At runtime, ternary weights are cached as FP32 tensors for
+PyTorch dispatch compatibility, so runtime memory equals FP32.  The
+accel phase shows 8,816 MB because both the original FP32 weights and
+packed C kernel weights coexist during conversion; after freeing
+original weights, memory drops to 5,120 MB.
+
+**4. Text quality degrades at threshold 0.7**
+
+The ternary model produces degenerate output ("shock shock shock...")
+because threshold 0.7 without sensitivity analysis quantises all 154
+layers uniformly, including precision-critical attention projections.
+This is an accuracy issue (addressable with per-layer threshold tuning),
+not a kernel correctness issue — the C+SIMD and PyTorch ternary paths
+produce identical degenerate text, confirming kernel equivalence.
+
+**5. Conversion is fast (11.2s one-time cost)**
+
+Converting 154 layers from FP32 to ternary takes 11.2 seconds.  This is
+a one-time cost amortised over all subsequent inference calls.
+
 ## Further Optimisation Path
 
 The 512x512 gap and potential for further gains at other sizes suggest
@@ -211,7 +276,7 @@ cd src/terncore/csrc && make test && cd ../../..
 # Run Python tests (84 tests + 3 skipped)
 pytest tests/ -v
 
-# Run benchmark
+# Run microbenchmark (isolated matmul)
 python benchmarks/bench_stage1b.py
 
 # JSON output only
@@ -219,6 +284,9 @@ python benchmarks/bench_stage1b.py --json-only
 
 # Custom iteration counts
 python benchmarks/bench_stage1b.py --warmup 200 --iters 2000
+
+# Run TinyLlama end-to-end benchmark (requires ~8 GB RAM, downloads model)
+python benchmarks/bench_tinyllama.py
 ```
 
 ## Patent Coverage
@@ -234,5 +302,6 @@ python benchmarks/bench_stage1b.py --warmup 200 --iters 2000
 ---
 
 *Phase 4 results generated 2026-02-23 on Darwin x86_64 (i9-9900K, AVX2, 8-core OpenMP).*
+*TinyLlama benchmark generated 2026-02-24 on the same system.*
 *Phase 2 baseline generated 2026-02-23 on the same system.*
-*Benchmark script: `benchmarks/bench_stage1b.py`*
+*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`*
