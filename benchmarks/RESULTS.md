@@ -243,6 +243,73 @@ produce identical degenerate text, confirming kernel equivalence.
 Converting 154 layers from FP32 to ternary takes 11.2 seconds.  This is
 a one-time cost amortised over all subsequent inference calls.
 
+## Perplexity Evaluation (WikiText-2)
+
+Automated perplexity evaluation using sliding-window NLL computation
+(HuggingFace standard method) on the WikiText-2 test set.
+
+### Configuration
+
+- **Model**: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+- **Dataset**: WikiText-2 (test split, 338,535 tokens)
+- **Stride**: 512
+- **Context length**: 2048 (model default)
+- **Quantisation threshold**: 0.7, no sensitivity analysis
+- **Method**: Sliding-window cross-entropy with overlap masking
+
+### Results
+
+| Phase | Perplexity | Time (s) | Gap vs FP32 |
+|-------|-----------|----------|-------------|
+| FP32 baseline | 7.19 | 7,261.8 | — |
+| Ternary (threshold=0.7) | 130,127.23 | ~7,200 | +1,809,837% |
+| C+SIMD Accel | SKIPPED | — | timeout (accel phase exceeded 5 hours) |
+
+### Key Observations
+
+**1. Ternary perplexity is degenerate at uniform threshold 0.7**
+
+PPL 130,127 vs FP32 PPL 7.19 confirms that uniform ternary quantisation
+at threshold 0.7 destroys model quality completely.  This is consistent
+with the TinyLlama end-to-end benchmark which produced degenerate text
+("shock shock shock...") at the same threshold.
+
+**2. The problem is threshold tuning, not kernel correctness**
+
+The ternary PyTorch path produces PPL 130,127.  The C+SIMD accel path
+was expected to produce the same value (confirming kernel equivalence),
+but exceeded the 5-hour evaluation budget and was skipped.  Kernel
+equivalence is already verified by the existing 84-test Python suite
+and the TinyLlama benchmark (identical degenerate text from both paths).
+
+**3. Per-layer sensitivity analysis is essential**
+
+Uniform threshold 0.7 quantises all 154 layers identically, including
+precision-critical attention Q/K/V projections.  Per-layer threshold
+tuning (via `SensitivityAnalyzer`) would protect these layers with
+lower thresholds, substantially reducing the perplexity gap.
+
+**4. Sparsity and compression match expectations**
+
+- Sparsity: 43.4% (standard normal weights at threshold 0.7)
+- Compression: 4.2x (2-bit packed + bitmap + alpha)
+
+### Reproducing
+
+```bash
+# Full evaluation (FP32 + ternary + optional accel)
+python benchmarks/eval_perplexity.py
+
+# Skip accel phase
+python benchmarks/eval_perplexity.py --skip-accel
+
+# JSON output only
+python benchmarks/eval_perplexity.py --json-only --skip-accel
+
+# Custom threshold
+python benchmarks/eval_perplexity.py --threshold 0.5
+```
+
 ## Further Optimisation Path
 
 The 512x512 gap and potential for further gains at other sizes suggest
@@ -304,4 +371,5 @@ python benchmarks/bench_tinyllama.py
 *Phase 4 results generated 2026-02-23 on Darwin x86_64 (i9-9900K, AVX2, 8-core OpenMP).*
 *TinyLlama benchmark generated 2026-02-24 on the same system.*
 *Phase 2 baseline generated 2026-02-23 on the same system.*
-*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`*
+*Perplexity evaluation generated 2026-02-24 on the same system.*
+*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`*
