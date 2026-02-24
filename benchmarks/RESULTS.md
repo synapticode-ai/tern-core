@@ -310,6 +310,53 @@ python benchmarks/eval_perplexity.py --json-only --skip-accel
 python benchmarks/eval_perplexity.py --threshold 0.5
 ```
 
+## Layer Sensitivity Analysis
+
+Per-layer sensitivity ranking for **TinyLlama-1.1B-Chat-v1.0** at threshold
+0.7.  Each layer is quantised individually to ternary while
+all other layers remain in FP32.  Perplexity is measured on the first
+4,096 tokens of WikiText-2 (stride=512,
+context=2048).
+
+### Top 10 Most Sensitive Layers (keep in FP16)
+
+| Rank | Layer | PPL | Delta | Ratio | Params | Sparsity |
+|------|-------|-----|-------|-------|--------|----------|
+| 1 | model.layers.2.mlp.down_proj | 69090.81 | +69083.62 | 9609.3x | 11.5M | 42.4% |
+| 2 | model.layers.5.self_attn.q_proj | 18.79 | +11.60 | 2.6x | 4.2M | 45.5% |
+| 3 | model.layers.5.self_attn.k_proj | 17.79 | +10.60 | 2.5x | 524.3K | 46.5% |
+| 4 | model.layers.4.self_attn.k_proj | 16.65 | +9.46 | 2.3x | 524.3K | 46.4% |
+| 5 | model.layers.4.self_attn.q_proj | 14.82 | +7.63 | 2.1x | 4.2M | 45.3% |
+| 6 | model.layers.6.self_attn.k_proj | 13.40 | +6.21 | 1.9x | 524.3K | 47.1% |
+| 7 | model.layers.8.self_attn.k_proj | 11.27 | +4.08 | 1.6x | 524.3K | 47.4% |
+| 8 | model.layers.6.self_attn.q_proj | 10.73 | +3.54 | 1.5x | 4.2M | 46.9% |
+| 9 | model.layers.8.self_attn.q_proj | 10.28 | +3.09 | 1.4x | 4.2M | 47.6% |
+| 10 | lm_head | 10.07 | +2.88 | 1.4x | 65.5M | 43.3% |
+
+### Bottom 10 Least Sensitive Layers (safe to ternarise)
+
+| Rank | Layer | PPL | Delta | Ratio | Params | Sparsity |
+|------|-------|-----|-------|-------|--------|----------|
+| 146 | model.layers.12.self_attn.o_proj | 7.21 | +0.02 | 1.003x | 4.2M | 43.6% |
+| 147 | model.layers.1.mlp.gate_proj | 7.21 | +0.02 | 1.003x | 11.5M | 42.7% |
+| 148 | model.layers.10.self_attn.o_proj | 7.21 | +0.02 | 1.003x | 4.2M | 43.1% |
+| 149 | model.layers.20.self_attn.v_proj | 7.21 | +0.02 | 1.003x | 524.3K | 43.7% |
+| 150 | model.layers.4.self_attn.o_proj | 7.21 | +0.02 | 1.003x | 4.2M | 43.1% |
+| 151 | model.layers.13.self_attn.v_proj | 7.21 | +0.02 | 1.002x | 524.3K | 43.5% |
+| 152 | model.layers.9.self_attn.o_proj | 7.21 | +0.02 | 1.002x | 4.2M | 43.2% |
+| 153 | model.layers.17.self_attn.v_proj | 7.21 | +0.02 | 1.002x | 524.3K | 44.2% |
+| 154 | model.layers.14.self_attn.v_proj | 7.20 | +0.01 | 1.002x | 524.3K | 44.0% |
+| 155 | model.layers.3.self_attn.v_proj | 7.18 | -0.01 | 0.999x | 524.3K | 43.4% |
+
+### Summary Statistics
+
+- **Layers tested**: 155 (skipped 0 with <1000 params)
+- **Baseline PPL**: 7.19 (FP32)
+- **Layers above 2.0x baseline**: 5 (3.2%)
+- **Layers above 1.5x baseline**: 7 (4.5%)
+- **Layers below 1.1x baseline**: 135 (87.1%)
+- **Evaluation**: 4,096 tokens, 10955s total
+
 ## Further Optimisation Path
 
 The 512x512 gap and potential for further gains at other sizes suggest

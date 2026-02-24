@@ -166,6 +166,7 @@ def evaluate_perplexity(
     stride: int,
     max_length: int,
     phase_name: str,
+    quiet: bool = False,
 ) -> PerplexityResult:
     """
     Compute perplexity using the standard sliding-window approach.
@@ -215,16 +216,17 @@ def evaluate_perplexity(
         prev_end = end
 
         # Progress reporting
-        pct = end / seq_len * 100
-        if num_windows % 10 == 0 or end >= seq_len:
-            current_ppl = torch.exp(torch.stack(nlls).sum() / end).item()
-            print(
-                f"\r    [{phase_name}] "
-                f"{end:,}/{seq_len:,} tokens "
-                f"({pct:.0f}%) — running PPL: {current_ppl:.2f}",
-                end="",
-                flush=True,
-            )
+        if not quiet:
+            pct = end / seq_len * 100
+            if num_windows % 10 == 0 or end >= seq_len:
+                current_ppl = torch.exp(torch.stack(nlls).sum() / end).item()
+                print(
+                    f"\r    [{phase_name}] "
+                    f"{end:,}/{seq_len:,} tokens "
+                    f"({pct:.0f}%) — running PPL: {current_ppl:.2f}",
+                    end="",
+                    flush=True,
+                )
 
         if end >= seq_len:
             break
@@ -240,7 +242,8 @@ def evaluate_perplexity(
     except OverflowError:
         ppl = float("inf")
 
-    print()  # newline after progress
+    if not quiet:
+        print()  # newline after progress
 
     return PerplexityResult(
         phase=phase_name,
