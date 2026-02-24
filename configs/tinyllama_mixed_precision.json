@@ -1,0 +1,50 @@
+{
+  "model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "threshold": 0.7,
+  "baseline_ppl": 7.19,
+  "recommended_config": {
+    "config_name": "v_proj_late3",
+    "description": "Ternarise v_proj in layers 19-21 only (3 layers). Estimated +4.1% gap on full WikiText-2.",
+    "ternary_layers": [
+      "model.layers.19.self_attn.v_proj",
+      "model.layers.20.self_attn.v_proj",
+      "model.layers.21.self_attn.v_proj"
+    ],
+    "num_ternary": 3,
+    "num_protected": 152,
+    "probe_result_2048_tokens": {
+      "ppl": 5.9754,
+      "gap_vs_fp32_2048": "+2.78%",
+      "estimated_gap_full_dataset": "+4.1%"
+    }
+  },
+  "validated_config": {
+    "config_name": "v_proj_late4",
+    "description": "Ternarise v_proj in layers 18-21 (4 layers). Full-dataset validation.",
+    "ternary_layers": [
+      "model.layers.18.self_attn.v_proj",
+      "model.layers.19.self_attn.v_proj",
+      "model.layers.20.self_attn.v_proj",
+      "model.layers.21.self_attn.v_proj"
+    ],
+    "num_ternary": 4,
+    "num_protected": 151,
+    "full_dataset_result": {
+      "ppl": 7.7156,
+      "gap_vs_fp32": "+7.31%",
+      "compression_ratio": 1.0,
+      "sparsity": 0.441,
+      "eval_time_s": 6938.1,
+      "tokens_evaluated": 338535,
+      "target_met": false
+    }
+  },
+  "findings": {
+    "sensitivity_based_protection_failed": true,
+    "reason": "Per-layer sensitivity analysis identifies individually low-impact layers, but compound errors across multiple ternary layers dominate. Protecting top-9 sensitive layers leaves 145 ternary layers that collectively produce PPL 78,155 (vs FP32 7.19).",
+    "type_based_approach_works": true,
+    "v_proj_layers_least_sensitive": true,
+    "compound_error_knee": "Between 3-4 v_proj layers (late blocks). Adding o_proj layers causes catastrophic compound errors.",
+    "compression_at_target_quality": "1.00x (negligible). Only 3-4 tiny v_proj layers (524K params each, 0.14-0.19% of 1.1B total) can be ternarised within <5% quality target."
+  }
+}

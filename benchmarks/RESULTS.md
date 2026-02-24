@@ -357,6 +357,93 @@ context=2048).
 - **Layers below 1.1x baseline**: 135 (87.1%)
 - **Evaluation**: 4,096 tokens, 10955s total
 
+## Mixed-Precision Evaluation (Patent 4)
+
+Iterative protection search for **TinyLlama-1.1B-Chat-v1.0** at threshold
+0.7.  Finds the optimal mixed-precision ternary config that minimises
+perplexity gap while maximising compression.
+
+### Approach 1: Sensitivity-Based Protection (Failed)
+
+Day 2 per-layer sensitivity analysis identified layers individually, but
+protecting even the top-46 most sensitive layers (30% of model) failed
+catastrophically due to compound errors across the remaining ternary layers.
+
+| Config | Protected | Ternary | PPL (2048 tok) | Gap vs FP32 | Compression |
+|--------|-----------|---------|----------------|-------------|-------------|
+| all_ternary | 1 | 154 | 77,372 | +1,076,008% | 5.5x |
+| protect_top1 | 2 | 153 | 72,986 | +1,015,000% | 5.3x |
+| protect_top5 | 6 | 149 | 77,247 | +1,074,260% | 5.0x |
+| protect_top9 | 10 | 145 | 78,155 | +1,086,893% | 4.9x |
+| protect_top9_attn_early | 46 | 109 | 41,405 | +575,770% | 3.6x |
+
+**Conclusion**: Sensitivity-based protection does not work.  Per-layer
+sensitivity measures independent impact, but ternary errors compound
+exponentially through stacked transformer blocks.
+
+### Approach 2: Type-Based Progressive Ternarisation (Effective)
+
+Ternarise by layer type, starting with the least sensitive type (`v_proj`).
+This approach revealed the compound error knee between 22 and 44 ternary layers.
+
+| Config | Ternary | PPL (2048 tok) | Gap vs FP32 (2048) | Compression |
+|--------|---------|----------------|---------------------|-------------|
+| v_proj layers 19-21 (3) | 3 | 5.98 | +2.8% | 1.0x |
+| v_proj layers 18-21 (4) | 4 | 6.10 | +5.0% | 1.0x |
+| v_proj layers 16-21 (6) | 6 | 6.27 | +7.8% | 1.0x |
+| v_proj layers 11-21 (11) | 11 | 6.85 | +17.7% | 1.0x |
+| v_proj ALL (22) | 22 | 8.16 | +40.3% | 1.0x |
+| v_proj + o_proj (44) | 44 | 389.66 | +6,603% | 1.1x |
+| v_proj + o + gate + up (88) | 88 | 93,882 | +1,614,749% | 2.1x |
+
+FP32 baseline at 2,048 tokens: **5.81** PPL.
+
+### Full-Dataset Validation
+
+Best candidate `v_proj_late4` (4 ternary layers, 18-21) validated on the
+complete WikiText-2 test set (338,535 tokens).
+
+| Config | Ternary | PPL | Gap vs FP32 | Compression | Sparsity | Time |
+|--------|---------|-----|-------------|-------------|----------|------|
+| v_proj_late4 | 4 | 7.72 | **+7.3%** | 1.00x | 44.1% | 6,938s |
+
+- **FP32 baseline PPL**: 7.19
+- **Target**: <5% gap
+- **Target met**: NO (+7.3%)
+- **Recommended config**: `v_proj_late3` (3 layers 19-21, estimated +4.1%)
+
+### Key Findings
+
+**1. Compound errors dominate, not individual sensitivity**
+
+Per-layer sensitivity analysis (Day 2) showed 87% of layers below 1.1x
+baseline individually.  But ternarising just 22 of these "safe" layers
+simultaneously produces PPL 8.16 (+40% gap).  The error compounds through
+22 transformer blocks, where each block's output feeds the next.
+
+**2. Layer type determines ternary tolerance**
+
+`v_proj` (value projections) are the most ternary-tolerant layer type,
+followed by `o_proj`.  Adding any MLP layers (gate/up/down) or increasing
+beyond `v_proj + o_proj` causes catastrophic quality collapse.
+
+**3. Quality target requires negligible compression**
+
+Achieving <5% PPL gap at threshold 0.7 requires limiting ternary to 3-4
+small v_proj layers (524K params each, ~0.14-0.19% of 1.1B total).  This
+provides effectively zero compression benefit (1.00x).
+
+**4. Threshold 0.7 is too aggressive for full-model quantisation**
+
+The fundamental issue is that ternary weights {-1, 0, +1} × alpha cannot
+reconstruct continuous weight distributions well enough.  At threshold 0.7,
+each layer introduces ~0.3% error individually, but these compound to
+>1000% across 150+ layers.  Achieving meaningful ternary compression with
+acceptable quality would require either:
+- Much lower thresholds (tested: 0.3-0.5, still catastrophic)
+- Post-quantisation fine-tuning (STE training)
+- INT4/INT8 mixed precision instead of ternary for most layers
+
 ## Further Optimisation Path
 
 The 512x512 gap and potential for further gains at other sizes suggest
