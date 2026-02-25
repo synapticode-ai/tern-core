@@ -812,7 +812,7 @@ cd src/terncore/csrc && make clean && make && cd ../../..
 # Run C tests (53 tests)
 cd src/terncore/csrc && make test && cd ../../..
 
-# Run Python tests (84 tests + 3 skipped)
+# Run Python tests (133 tests + 3 skipped)
 pytest tests/ -v
 
 # Run microbenchmark (isolated matmul)
@@ -850,7 +850,8 @@ python benchmarks/bench_tinyllama.py
 *Weight analysis, gradient probe, STE comparison generated 2026-02-25 on the same system.*
 *.tern-model v2 format and serialisation generated 2026-02-25 on the same system.*
 *.tern-model round-trip validation generated 2026-02-25 on the same system.*
-*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`, `benchmarks/bench_day7_roundtrip.py`*
+*PackedTernaryLinear benchmark generated 2026-02-25 on the same system.*
+*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`, `benchmarks/bench_day7_roundtrip.py`, `benchmarks/bench_day8_packing.py`*
 
 ---
 
@@ -1012,3 +1013,130 @@ Total test suite: **115 passed**, 3 skipped (TinyLlama download-dependent).
 | Patent 6 | Model format | `reconstruct_layer()` / `reconstruct_all()` — complete read path |
 | Patent 8 | Serialisation | Bit-identical round-trip proof (tensor diff = 0.0) |
 | Patent 36 | Deterministic reproducibility | Same model → same .tern-model → same output (verified) |
+
+---
+
+## Day 8: PackedTernaryLinear — 2-Bit Packed Weight Storage
+
+### Overview
+
+`PackedTernaryLinear` is an `nn.Module` that stores weights in 2-bit packed format
+(4 weights per byte) instead of FP32 (4 bytes per weight).  This achieves **16x
+weight compression** while producing identical inference output.
+
+The forward path unpacks 2-bit → ternary float → F.linear.  Memory savings come
+from storage, not compute.  A fast path sends packed weights directly to the C
+SIMD kernel when available.
+
+### Memory Comparison (weight storage only, no bias)
+
+| Size | FP32 (bytes) | TernaryLinear (bytes) | Packed (bytes) | vs FP32 | vs Ternary |
+|------|-------------|----------------------|----------------|---------|------------|
+| 256x256 | 262,144 | 262,148 | 16,388 | **16.0x** | **16.0x** |
+| 512x512 | 1,048,576 | 1,048,580 | 65,540 | **16.0x** | **16.0x** |
+| 2048x2048 | 16,777,216 | 16,777,220 | 1,048,580 | **16.0x** | **16.0x** |
+| 2048x256 | 2,097,152 | 2,097,156 | 131,076 | **16.0x** | **16.0x** |
+
+Packed storage = 2-bit packed weights + 4-byte alpha scalar.
+TernaryLinear stores FP32 parameters (same size as nn.Linear), caches int8 ternary.
+
+### Conversion Overhead
+
+| Size | Time (ms) |
+|------|----------|
+| 256x256 | 1.0 |
+| 512x512 | 1.7 |
+| 2048x2048 | 42.0 |
+| 2048x256 | 4.2 |
+
+Conversion includes: quantise (FP32 → ternary + alpha) + pack (ternary → 2-bit).
+One-time cost amortised over all subsequent inference calls.
+
+### Inference Latency (batch=1)
+
+| Size | nn.Linear (us) | Packed (us) | Ratio |
+|------|---------------|-------------|-------|
+| 256x256 | 11.2 | 404.7 | 0.03x |
+| 512x512 | 13.8 | 481.5 | 0.03x |
+| 2048x2048 | 298.1 | 11,327.6 | 0.03x |
+| 2048x256 | 16.0 | 829.3 | 0.02x |
+
+**Expected result**: PackedTernaryLinear is slower per-forward because it unpacks
+2-bit → float on every call.  The benefit is **memory**, not latency.  For latency,
+use `TernaryLinearAccel` (C SIMD kernel that operates on packed weights directly
+without intermediate float expansion).
+
+The fast path (`packed_ternary_matmul_fast`) sends packed uint8 weights directly
+to the C kernel with bitmap-driven zero-skip, but the unpack overhead for bitmap
+construction currently negates the SIMD gains.  Caching the bitmap (as
+TernaryLinearAccel does) would eliminate this overhead.
+
+### Multi-Layer Model Conversion
+
+| Metric | Value |
+|--------|-------|
+| Model | 3-layer MLP (2048→2048→2048→512) + head (512→32000) |
+| Before (FP32) | 98.6 MB |
+| After (packed + protected head) | 64.9 MB |
+| Compression | 1.52x |
+| Packed layers | 3 |
+| Protected layers | 1 (head) |
+| Conversion time | 127.1 ms |
+
+Overall model compression is 1.52x because the protected head layer (512x32000 =
+16M params, FP32) dominates total size.  The 3 packed layers achieve 16x each,
+but the head remains at 4 bytes/weight.
+
+### Correctness
+
+| Size | Max Diff | Status |
+|------|----------|--------|
+| 256x256 | 0.00e+00 | PASS |
+| 512x512 | 1.19e-07 | PASS |
+| 2048x2048 | 2.38e-07 | PASS |
+| 2048x256 | 0.00e+00 | PASS |
+
+PackedTernaryLinear output matches TernaryLinear within FP32 rounding tolerance
+(atol=1e-5).  The sub-1e-7 differences come from F.linear accumulation order
+when operating on identical weight values.
+
+### TernModelReader Integration
+
+`TernModelReader.load_packed_model(model)` loads .tern-model weights directly
+as `PackedTernaryLinear` layers — no re-quantisation or re-packing needed.
+Ternary layers get the packed bytes from the file; FP16 layers stay as nn.Linear.
+
+### Test Results
+
+18 new tests in `tests/test_packed_linear.py`, all passing:
+
+| Test | Verified |
+|------|----------|
+| `test_from_float_basic` | nn.Linear → PackedTernaryLinear, output shape correct |
+| `test_from_float_matches_ternary` | Output matches TernaryLinear within 1e-5 |
+| `test_from_ternary_linear` | TernaryLinear → PackedTernaryLinear, bit-identical |
+| `test_from_packed_data` | Create from raw packed bytes + alpha |
+| `test_memory_footprint` | 16x compression ratio verified |
+| `test_memory_footprint_with_bias` | Bias bytes included in footprint |
+| `test_forward_with_bias` | Bias added correctly in forward pass |
+| `test_no_bias` | Forward works without bias |
+| `test_gradient_not_needed` | Packed weights don't require grad |
+| `test_extra_repr` | Compression info in repr string |
+| `test_3d_input` | Handles (batch, seq_len, features) input |
+| `test_packed_matmul_correctness` | Packed matmul matches manual computation |
+| `test_packed_matmul_shapes` | Multiple batch sizes and feature dims |
+| `test_packed_matmul_fast_matches_reference` | C kernel fast path matches reference |
+| `test_convert_simple_model` | 2-layer model conversion |
+| `test_convert_with_protection` | Protected layers stay as nn.Linear |
+| `test_memory_reduction_after_conversion` | >15x weight compression verified |
+| `test_load_packed_from_tern_model` | .tern-model → PackedTernaryLinear integration |
+
+Total test suite: **133 passed**, 3 skipped (TinyLlama download-dependent).
+
+### Patent Alignment
+
+| Patent | Claim | Implementation |
+|--------|-------|---------------|
+| Patent 1 | Ternary weight encoding | `from_float()` quantises FP32 → {-1, 0, +1} + alpha |
+| Patent 5 | Ternary execution path | `packed_ternary_matmul_fast()` — C kernel with packed weights |
+| Patent 39 | Ternary-native memory | 2-bit packed storage (4 weights/byte), 16x compression |

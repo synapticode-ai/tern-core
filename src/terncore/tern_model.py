@@ -686,3 +686,95 @@ class TernModelReader:
     def layer_info(self, name: str) -> dict:
         """Get manifest metadata for a layer without loading weights."""
         return dict(self._get_manifest_entry(name))
+
+    # ── Packed loading ──────────────────────────────────────────
+
+    def load_packed_model(
+        self, model: nn.Module
+    ) -> Tuple[list[str], list[str]]:
+        """
+        Load .tern-model weights as PackedTernaryLinear layers.
+
+        For ternary layers: create PackedTernaryLinear from packed bytes
+        (no re-quantisation — directly use the packed data from file).
+
+        For FP16 layers: load as regular nn.Linear weights.
+
+        Args:
+            model: PyTorch model to modify in-place.
+
+        Returns:
+            (missing_keys, unexpected_keys) analogous to load_state_dict.
+        """
+        from terncore.packed_linear import PackedTernaryLinear
+
+        loaded_keys: list[str] = []
+        model_keys = set(dict(model.named_parameters()).keys())
+        model_keys.update(dict(model.named_buffers()).keys())
+
+        for entry in self.manifest["layers"]:
+            name = entry["name"]
+            raw = self.read_layer_data(name)
+            buf = io.BytesIO(raw)
+
+            if entry["dtype"] == "ternary2":
+                # Read alpha and packed weights directly
+                alpha = struct.unpack("<f", buf.read(4))[0]
+                packed_size = struct.unpack("<I", buf.read(4))[0]
+                packed_bytes = buf.read(packed_size)
+                packed_tensor = torch.frombuffer(
+                    bytearray(packed_bytes), dtype=torch.uint8
+                ).clone()
+
+                # Skip bitmap
+                bitmap_size = struct.unpack("<I", buf.read(4))[0]
+                if bitmap_size > 0:
+                    buf.read(bitmap_size)
+
+                # Read bias
+                bias_size = struct.unpack("<I", buf.read(4))[0]
+                bias = None
+                if bias_size > 0:
+                    bias_data = buf.read(bias_size)
+                    bias = torch.frombuffer(
+                        bytearray(bias_data), dtype=torch.float32
+                    ).clone()
+
+                packed_layer = PackedTernaryLinear.from_packed_data(
+                    packed_weights=packed_tensor,
+                    alpha=alpha,
+                    in_features=entry["shape"][1],
+                    out_features=entry["shape"][0],
+                    bias=bias,
+                )
+
+                # Replace module in model
+                parts = name.split(".")
+                parent = model
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                setattr(parent, parts[-1], packed_layer)
+
+                loaded_keys.append(f"{name}.packed_weights")
+                loaded_keys.append(f"{name}.alpha")
+                if bias is not None:
+                    loaded_keys.append(f"{name}.bias")
+
+            elif entry["dtype"] == "float16":
+                tensors = self._reconstruct_fp16(buf, entry)
+                # Set weight on the existing module
+                parts = name.split(".")
+                parent = model
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                module = getattr(parent, parts[-1])
+                if isinstance(module, nn.Linear):
+                    module.weight.data = tensors["weight"]
+                    loaded_keys.append(f"{name}.weight")
+                    if "bias" in tensors and module.bias is not None:
+                        module.bias.data = tensors["bias"]
+                        loaded_keys.append(f"{name}.bias")
+
+        missing = [k for k in model_keys if k not in loaded_keys]
+        unexpected = [k for k in loaded_keys if k not in model_keys]
+        return missing, unexpected
