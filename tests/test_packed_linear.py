@@ -331,8 +331,8 @@ class TestModelConversion:
 
         assert after_bytes < before_bytes
         ratio = before_bytes / after_bytes
-        # Should be close to 16x (slight overhead from alpha)
-        assert ratio > 15.0, f"Compression only {ratio:.1f}x (expected >15x)"
+        # 2-bit packed + 1-bit bitmap = 3 bits/weight → ~10.7x vs FP32
+        assert ratio > 10.0, f"Compression only {ratio:.1f}x (expected >10x)"
 
 
 class TestTernModelReaderPacked:

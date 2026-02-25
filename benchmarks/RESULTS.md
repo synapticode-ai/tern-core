@@ -812,7 +812,7 @@ cd src/terncore/csrc && make clean && make && cd ../../..
 # Run C tests (53 tests)
 cd src/terncore/csrc && make test && cd ../../..
 
-# Run Python tests (133 tests + 3 skipped)
+# Run Python tests (148 tests + 3 skipped)
 pytest tests/ -v
 
 # Run microbenchmark (isolated matmul)
@@ -851,7 +851,8 @@ python benchmarks/bench_tinyllama.py
 *.tern-model v2 format and serialisation generated 2026-02-25 on the same system.*
 *.tern-model round-trip validation generated 2026-02-25 on the same system.*
 *PackedTernaryLinear benchmark generated 2026-02-25 on the same system.*
-*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`, `benchmarks/bench_day7_roundtrip.py`, `benchmarks/bench_day8_packing.py`*
+*Sparsity bitmap zero-skip benchmark generated 2026-02-25 on the same system.*
+*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`, `benchmarks/bench_day7_roundtrip.py`, `benchmarks/bench_day8_packing.py`, `benchmarks/bench_day9_sparsity.py`*
 
 ---
 
@@ -1140,3 +1141,109 @@ Total test suite: **133 passed**, 3 skipped (TinyLlama download-dependent).
 | Patent 1 | Ternary weight encoding | `from_float()` quantises FP32 → {-1, 0, +1} + alpha |
 | Patent 5 | Ternary execution path | `packed_ternary_matmul_fast()` — C kernel with packed weights |
 | Patent 39 | Ternary-native memory | 2-bit packed storage (4 weights/byte), 16x compression |
+
+---
+
+## Day 9: Sparsity Bitmap Zero-Skip — Cached Bitmap + Speedup
+
+### Overview
+
+Day 8 identified that `PackedTernaryLinear` rebuilt the sparsity bitmap from
+scratch on every forward call — unpacking weights just to determine which are
+non-zero.  This negated the SIMD zero-skip gains.  Day 9 fixes this by caching
+the bitmap as a buffer at construction time.
+
+The C kernel `tern_sparse64_packed_matmul_f32` uses 64-weight block zero-skip
+with CTZ bit-scan iteration — it only visits non-zero weight positions.  With
+the bitmap cached, this kernel can now run without per-call overhead.
+
+### Bitmap Caching Speedup (2048x2048)
+
+| Path | Latency (us) | vs Cached |
+|------|-------------|-----------|
+| Cached bitmap (new) | 12,108 | **1.00x** |
+| Rebuilt per-call (Day 8) | 25,106 | 0.48x |
+| Reference (F.linear) | 13,131 | 0.92x |
+
+**Bitmap caching provides 2.07x speedup** over the Day 8 rebuilt-per-call path.
+The cached path is now competitive with the pure F.linear reference (0.92x),
+down from 0.03x in Day 8.  The remaining gap is the ctypes marshalling overhead.
+
+### Zero-Skip Speedup vs Sparsity (2048x2048)
+
+| Sparsity | C+Skip (us) | Reference (us) | Speedup | BlockSkip |
+|----------|------------|---------------|---------|-----------|
+| 0% | 18,253 | 14,871 | 0.81x | 0.0% |
+| 20% | 16,441 | 15,244 | 0.93x | 0.0% |
+| 40% | 11,488 | 13,961 | **1.22x** | 0.0% |
+| 50% | 9,674 | 13,229 | **1.37x** | 0.0% |
+| 60% | 7,629 | 13,715 | **1.80x** | 0.0% |
+| 80% | 4,322 | 12,645 | **2.93x** | 0.0% |
+| 90% | 2,316 | 12,221 | **5.28x** | 0.0% |
+
+The zero-skip kernel breaks even at ~35% sparsity and scales linearly with
+non-zero weight count.  At 90% sparsity (10% non-zero), the kernel is **5.28x
+faster** than the unpack-and-F.linear reference.
+
+### Block-Level Sparsity Analysis
+
+With uniformly distributed random sparsity, almost no blocks are entirely zero
+even at high element-wise sparsity.  This is expected: at 65% element sparsity,
+the probability of a 256-weight block being all-zero is 0.35^256 ≈ 0.
+
+| Element Sparsity | Block Size | Zero Blocks | Block Skip Ratio |
+|-----------------|-----------|------------|-----------------|
+| 30% | 64 | 0/65,536 | 0.0% |
+| 44% | 64 | 0/65,536 | 0.0% |
+| 65% | 64 | 0/65,536 | 0.0% |
+| 80% | 64 | 0/65,536 | 0.0% |
+| 90% | 64 | 75/65,536 | 0.1% |
+
+**Key insight**: Block-level zero-skip (skipping entire 64-weight blocks) is
+negligible for uniformly distributed sparsity.  The speedup comes entirely from
+**element-level bit-scan** — the CTZ loop visits only set bitmap bits, skipping
+individual zero weights.  For structured sparsity (e.g., trained models with
+row/column pruning), block-skip ratios would be much higher.
+
+### Synthetic Model Sparsity Report
+
+Standard normal weights at threshold 0.7 produce ~35% element sparsity with
+0% block-level sparsity:
+
+| Layer | Weights | Element Sparsity | Block Skip (256) |
+|-------|---------|-----------------|-----------------|
+| fc1 | 4,194,304 | 35.0% | 0.0% |
+| fc2 | 1,048,576 | 35.0% | 0.0% |
+| fc3 | 131,072 | 34.8% | 0.0% |
+
+### Test Results
+
+15 new tests in `tests/test_sparsity.py`, all passing:
+
+| Test | Verified |
+|------|----------|
+| `test_bitmap_stored_at_construction` | Non-zero bitmap after from_float() |
+| `test_bitmap_matches_weights` | Bitmap correctly identifies non-zero positions |
+| `test_bitmap_correct_size` | Bitmap byte count matches weight count |
+| `test_from_packed_data_with_bitmap` | Pre-built bitmap used directly |
+| `test_from_packed_data_generates_bitmap_if_missing` | Auto-generates if not provided |
+| `test_forward_with_cached_bitmap_matches_reference` | Cached path matches reference output |
+| `test_from_ternary_linear_has_bitmap` | from_ternary_linear() caches bitmap |
+| `test_bitmap_from_tern_model` | .tern-model bitmap passed through |
+| `test_block_analysis_all_zero` | 100% sparsity → all blocks zero |
+| `test_block_analysis_no_zero` | 0% sparsity → no zero blocks |
+| `test_block_analysis_partial` | Partial sparsity analysis works |
+| `test_block_analysis_returns_expected_keys` | Result dict has all fields |
+| `test_model_sparsity_report` | Per-layer report for multi-layer model |
+| `test_zero_skip_same_output` | Zero-skip matches reference output |
+| `test_high_sparsity_correctness` | Correct at 90% sparsity |
+
+Total test suite: **148 passed**, 3 skipped (TinyLlama download-dependent).
+
+### Patent Alignment
+
+| Patent | Claim | Implementation |
+|--------|-------|---------------|
+| Patent 7 | Sparsity-aware execution | Cached bitmap buffer in PackedTernaryLinear |
+| Patent 9 | Zero-skip optimization | `tern_sparse64_packed_matmul_f32` — 64-weight block skip + CTZ bit-scan |
+| Patent 37 | Zero-weight clock-gating | Block-level skip when all 64 bitmap bits are zero |

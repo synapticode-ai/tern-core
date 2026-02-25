@@ -55,6 +55,7 @@ def packed_ternary_matmul_fast(
     alpha: float,
     out_features: int,
     in_features: int,
+    sparsity_bitmap: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Optimised packed matmul — pass packed weights directly to C kernel.
@@ -63,12 +64,19 @@ def packed_ternary_matmul_fast(
     weights with bitmap-driven zero-skip and alpha scaling built in.
     Falls back to reference path if C acceleration is not available.
 
+    When sparsity_bitmap is provided (cached), the expensive per-call
+    bitmap rebuild is skipped entirely.
+
+    Patent 7: Cached sparsity bitmap for zero-skip.
+    Patent 9: Zero-skip via bitmap-driven sparse kernel.
+
     Args:
-        input:          Input tensor (..., in_features).
-        packed_weights: Uint8 tensor with 2-bit packed weights.
-        alpha:          Per-layer scaling factor.
-        out_features:   Number of output features.
-        in_features:    Number of input features.
+        input:           Input tensor (..., in_features).
+        packed_weights:  Uint8 tensor with 2-bit packed weights.
+        alpha:           Per-layer scaling factor.
+        out_features:    Number of output features.
+        in_features:     Number of input features.
+        sparsity_bitmap: Optional pre-built bitmap (1 bit/weight, LSB-first).
 
     Returns:
         Output tensor (..., out_features).
@@ -93,11 +101,18 @@ def packed_ternary_matmul_fast(
                 packed_weights.numpy(), dtype=np.uint8
             )
 
-            # Build sparsity bitmap (1 bit per weight, LSB-first)
-            shape = torch.Size([out_features, in_features])
-            ternary = unpack_ternary_weights(packed_weights, shape)
-            bitmap_bool = (ternary.flatten() != 0).numpy().astype(np.uint8)
-            bitmap_np = np.packbits(bitmap_bool, bitorder="little")
+            # Use cached bitmap or build on the fly
+            if sparsity_bitmap is not None:
+                bitmap_np = np.ascontiguousarray(
+                    sparsity_bitmap.numpy(), dtype=np.uint8
+                )
+            else:
+                shape = torch.Size([out_features, in_features])
+                ternary = unpack_ternary_weights(packed_weights, shape)
+                bitmap_bool = (
+                    ternary.flatten() != 0
+                ).numpy().astype(np.uint8)
+                bitmap_np = np.packbits(bitmap_bool, bitorder="little")
 
             out_np = np.zeros((batch, out_features), dtype=np.float32)
 

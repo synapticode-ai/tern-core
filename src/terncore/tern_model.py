@@ -726,10 +726,14 @@ class TernModelReader:
                     bytearray(packed_bytes), dtype=torch.uint8
                 ).clone()
 
-                # Skip bitmap
+                # Read bitmap (pass through to PackedTernaryLinear)
                 bitmap_size = struct.unpack("<I", buf.read(4))[0]
+                bitmap_tensor = None
                 if bitmap_size > 0:
-                    buf.read(bitmap_size)
+                    bitmap_data = buf.read(bitmap_size)
+                    bitmap_tensor = torch.frombuffer(
+                        bytearray(bitmap_data), dtype=torch.uint8
+                    ).clone()
 
                 # Read bias
                 bias_size = struct.unpack("<I", buf.read(4))[0]
@@ -746,6 +750,7 @@ class TernModelReader:
                     in_features=entry["shape"][1],
                     out_features=entry["shape"][0],
                     bias=bias,
+                    sparsity_bitmap=bitmap_tensor,
                 )
 
                 # Replace module in model

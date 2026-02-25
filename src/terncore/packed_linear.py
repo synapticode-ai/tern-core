@@ -3,6 +3,7 @@ PackedTernaryLinear — linear layer with 2-bit packed weight storage.
 
 Patent 1: Ternary weight encoding {-1, 0, +1}.
 Patent 5: Packed ternary execution path.
+Patent 7: Sparsity-aware execution — cached bitmap for zero-skip.
 Patent 39: Ternary-native memory — 2-bit packed format (4 weights/byte).
 
 Memory comparison (1M weights):
@@ -10,8 +11,8 @@ Memory comparison (1M weights):
     int8:     1,000,000 bytes (1 B/weight)  — TernaryLinear cached
     2-bit:      250,000 bytes (0.25 B/weight) — PackedTernaryLinear
 
-Forward path: unpack 2-bit → ternary float → F.linear (reuses proven kernels).
-The memory savings come from storage, not compute. Direct 2-bit compute is Stage 2.
+Forward path: packed weights + cached bitmap → C kernel with zero-skip.
+Fallback: unpack 2-bit → ternary float → F.linear.
 
 Copyright (c) 2025 Synapticode Co., Ltd. All rights reserved.
 """
@@ -23,16 +24,37 @@ import torch.nn as nn
 from typing import Optional
 
 from terncore.arithmetic.quantizer import TernaryQuantizer
-from terncore.packed_ops import packed_ternary_matmul
-from terncore.sparse import pack_ternary_weights
+from terncore.packed_ops import packed_ternary_matmul, packed_ternary_matmul_fast
+from terncore.sparse import pack_ternary_weights, unpack_ternary_weights
+
+
+def _build_bitmap_from_packed(
+    packed_weights: torch.Tensor,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    """Build sparsity bitmap (1 bit per weight, LSB-first, uint8-packed).
+
+    Patent 7: Sparsity bitmap for zero-skip execution.
+    """
+    import numpy as np
+
+    shape = torch.Size([out_features, in_features])
+    ternary = unpack_ternary_weights(packed_weights, shape)
+    bitmap_bool = (ternary.flatten() != 0).numpy().astype(np.uint8)
+    bitmap_np = np.packbits(bitmap_bool, bitorder="little")
+    return torch.from_numpy(bitmap_np.copy())
 
 
 class PackedTernaryLinear(nn.Module):
     """
     Linear layer that stores weights in 2-bit packed format.
 
-    Memory: 2 bits/weight + alpha (float32) vs 32 bits/weight for float32.
-    That's 16x reduction for weight storage.
+    Memory: 2 bits/weight + alpha (float32) + bitmap (1 bit/weight)
+    vs 32 bits/weight for float32.  That's ~10.7x effective compression.
+
+    The sparsity bitmap is cached at construction time so the C kernel
+    can skip zero-weight blocks without per-call bitmap rebuilds.
 
     Inference-only: no gradients through packed weights.
 
@@ -61,6 +83,12 @@ class PackedTernaryLinear(nn.Module):
         )
         self.register_buffer(
             "alpha", torch.tensor(alpha, dtype=torch.float32)
+        )
+
+        # Cached sparsity bitmap: 1 bit per weight, LSB-first (Patent 7)
+        n_bitmap_bytes = (in_features * out_features + 7) // 8
+        self.register_buffer(
+            "sparsity_bitmap", torch.zeros(n_bitmap_bytes, dtype=torch.uint8)
         )
 
         if bias:
@@ -100,6 +128,12 @@ class PackedTernaryLinear(nn.Module):
         )
         layer.packed_weights.copy_(packed)
 
+        # Build and cache sparsity bitmap (Patent 7)
+        bitmap = _build_bitmap_from_packed(
+            packed, linear.out_features, linear.in_features
+        )
+        layer.sparsity_bitmap.copy_(bitmap)
+
         if linear.bias is not None:
             layer.bias.data.copy_(linear.bias.data)
 
@@ -136,6 +170,12 @@ class PackedTernaryLinear(nn.Module):
         )
         layer.packed_weights.copy_(packed)
 
+        # Build and cache sparsity bitmap (Patent 7)
+        bitmap = _build_bitmap_from_packed(
+            packed, ternary_linear.out_features, ternary_linear.in_features
+        )
+        layer.sparsity_bitmap.copy_(bitmap)
+
         if ternary_linear.bias is not None:
             layer.bias.data.copy_(ternary_linear.bias.data)
 
@@ -149,6 +189,7 @@ class PackedTernaryLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: Optional[torch.Tensor] = None,
+        sparsity_bitmap: Optional[torch.Tensor] = None,
     ) -> "PackedTernaryLinear":
         """
         Create from pre-packed data (e.g. loaded from .tern-model).
@@ -156,12 +197,16 @@ class PackedTernaryLinear(nn.Module):
         This is the fast path: no re-quantisation, no re-packing.
         Just assign the packed bytes directly.
 
+        If sparsity_bitmap is provided, uses it directly (zero overhead).
+        If not provided, generates it from packed_weights (one-time cost).
+
         Args:
-            packed_weights: Uint8 tensor with 2-bit packed weights.
-            alpha:          Per-layer scaling factor.
-            in_features:    Input feature dimension.
-            out_features:   Output feature dimension.
-            bias:           Optional bias tensor.
+            packed_weights:  Uint8 tensor with 2-bit packed weights.
+            alpha:           Per-layer scaling factor.
+            in_features:     Input feature dimension.
+            out_features:    Output feature dimension.
+            bias:            Optional bias tensor.
+            sparsity_bitmap: Optional pre-built sparsity bitmap.
 
         Returns:
             PackedTernaryLinear ready for inference.
@@ -174,6 +219,15 @@ class PackedTernaryLinear(nn.Module):
         )
         layer.packed_weights.copy_(packed_weights)
 
+        # Use provided bitmap or generate from packed weights
+        if sparsity_bitmap is not None:
+            layer.sparsity_bitmap.copy_(sparsity_bitmap)
+        else:
+            bitmap = _build_bitmap_from_packed(
+                packed_weights, out_features, in_features
+            )
+            layer.sparsity_bitmap.copy_(bitmap)
+
         if bias is not None:
             layer.bias.data.copy_(bias)
 
@@ -181,10 +235,13 @@ class PackedTernaryLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass using packed weights.
+        Forward pass using packed weights with cached bitmap zero-skip.
 
-        Unpacks 2-bit → ternary float → matmul. The memory savings come from
-        storing weights as 2-bit; compute uses the proven float path.
+        Uses the C kernel fast path with pre-built sparsity bitmap when
+        available. Falls back to unpack → float → F.linear.
+
+        Patent 7: Cached bitmap eliminates per-call bitmap rebuild.
+        Patent 9: Zero-skip via bitmap-driven sparse kernel.
 
         Args:
             x: Input tensor (..., in_features).
@@ -192,12 +249,13 @@ class PackedTernaryLinear(nn.Module):
         Returns:
             Output tensor (..., out_features).
         """
-        output = packed_ternary_matmul(
+        output = packed_ternary_matmul_fast(
             x,
             self.packed_weights,
             self.alpha.item(),
             self.out_features,
             self.in_features,
+            sparsity_bitmap=self.sparsity_bitmap,
         )
         if self.bias is not None:
             output = output + self.bias
@@ -211,15 +269,18 @@ class PackedTernaryLinear(nn.Module):
             Dict with packed_bytes, float32_bytes, compression_ratio, etc.
         """
         packed_bytes = self.packed_weights.nelement()
+        bitmap_bytes = self.sparsity_bitmap.nelement()
         float32_bytes = self.in_features * self.out_features * 4
         bias_bytes = self.out_features * 4 if self.bias is not None else 0
+        total_packed = packed_bytes + 4 + bitmap_bytes + bias_bytes
         return {
             "packed_bytes": packed_bytes,
+            "bitmap_bytes": bitmap_bytes,
             "float32_bytes": float32_bytes,
             "compression_ratio": float32_bytes / packed_bytes if packed_bytes > 0 else 0,
             "alpha_bytes": 4,
             "bias_bytes": bias_bytes,
-            "total_packed_bytes": packed_bytes + 4 + bias_bytes,
+            "total_packed_bytes": total_packed,
             "total_float32_bytes": float32_bytes + bias_bytes,
         }
 

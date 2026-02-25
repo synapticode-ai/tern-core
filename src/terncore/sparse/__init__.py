@@ -143,6 +143,106 @@ def unpack_ternary_weights(
     return ternary.reshape(original_shape)
 
 
+def analyze_block_sparsity(
+    packed_weights: torch.Tensor,
+    out_features: int,
+    in_features: int,
+    block_size: int = 256,
+) -> dict:
+    """
+    Analyze sparsity at the block level for packed ternary weights.
+
+    Determines what fraction of fixed-size weight blocks are entirely
+    zero — these blocks can be skipped completely by hardware zero-skip.
+
+    Patent 7: Block-level sparsity analysis for zero-skip optimisation.
+    Patent 9: Hierarchical sparsity across weight blocks.
+
+    Args:
+        packed_weights: Uint8 tensor with 2-bit packed weights.
+        out_features:   Number of output features.
+        in_features:    Number of input features.
+        block_size:     Number of weights per block (default 256).
+
+    Returns:
+        Dict with total_weights, zero_weights, sparsity, total_blocks,
+        zero_blocks, block_skip_ratio, block_sparsity_histogram.
+    """
+    shape = torch.Size([out_features, in_features])
+    ternary = unpack_ternary_weights(packed_weights, shape)
+    flat = ternary.flatten()
+
+    total_weights = flat.numel()
+    zero_weights = (flat == 0).sum().item()
+    sparsity = zero_weights / total_weights if total_weights > 0 else 0.0
+
+    # Block-level analysis
+    n_blocks = (total_weights + block_size - 1) // block_size
+    zero_blocks = 0
+    block_sparsities = []
+
+    for i in range(n_blocks):
+        start = i * block_size
+        end = min(start + block_size, total_weights)
+        block = flat[start:end]
+        block_zeros = (block == 0).sum().item()
+        block_sparsity = block_zeros / block.numel()
+        block_sparsities.append(block_sparsity)
+        if block_zeros == block.numel():
+            zero_blocks += 1
+
+    # Histogram: bucket block sparsities into 10 bins
+    histogram = [0] * 10
+    for bs in block_sparsities:
+        bin_idx = min(int(bs * 10), 9)
+        histogram[bin_idx] += 1
+
+    return {
+        "total_weights": total_weights,
+        "zero_weights": int(zero_weights),
+        "sparsity": round(sparsity, 4),
+        "total_blocks": n_blocks,
+        "zero_blocks": zero_blocks,
+        "block_skip_ratio": round(
+            zero_blocks / n_blocks if n_blocks > 0 else 0.0, 4
+        ),
+        "block_size": block_size,
+        "block_sparsity_histogram": histogram,
+        "mean_block_sparsity": round(
+            sum(block_sparsities) / len(block_sparsities)
+            if block_sparsities else 0.0,
+            4,
+        ),
+    }
+
+
+def model_sparsity_report(model) -> list[dict]:
+    """
+    Generate sparsity report for all PackedTernaryLinear layers in a model.
+
+    Patent 9: Hierarchical sparsity across model layers.
+
+    Args:
+        model: PyTorch model with PackedTernaryLinear layers.
+
+    Returns:
+        List of per-layer sparsity analysis dicts.
+    """
+    from terncore.packed_linear import PackedTernaryLinear
+
+    report = []
+    for name, module in model.named_modules():
+        if isinstance(module, PackedTernaryLinear):
+            analysis = analyze_block_sparsity(
+                module.packed_weights,
+                module.out_features,
+                module.in_features,
+            )
+            analysis["name"] = name
+            report.append(analysis)
+    return report
+
+
 def sparsity_info(ternary_weights: torch.Tensor) -> SparsityInfo:
     """Calculate sparsity statistics for a ternary weight tensor."""
     total = ternary_weights.numel()
