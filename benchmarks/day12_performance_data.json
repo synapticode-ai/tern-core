@@ -1,0 +1,289 @@
+{
+  "meta": {
+    "timestamp": "2026-02-25T21:01:04.629263",
+    "total_time_s": 3452.2,
+    "num_tokens": 32,
+    "warmup_runs": 1,
+    "measured_runs": 3,
+    "threshold": 0.7,
+    "seed": 42,
+    "recon_mode": false
+  },
+  "results": [
+    {
+      "model": "DistilGPT-2 (82M)",
+      "params_m": 81.9,
+      "seq_len": 128,
+      "mode": "FP32",
+      "tok_s": 62.72,
+      "peak_mb": 808.0,
+      "model_mb": 318.5,
+      "prefill_ms": 63.1,
+      "per_token_ms": 15.9
+    },
+    {
+      "model": "DistilGPT-2 (82M)",
+      "params_m": 81.9,
+      "seq_len": 512,
+      "mode": "FP32",
+      "tok_s": 50.14,
+      "peak_mb": 964.0,
+      "model_mb": 318.5,
+      "prefill_ms": 213.7,
+      "per_token_ms": 19.9
+    },
+    {
+      "model": "DistilGPT-2 (82M)",
+      "params_m": 81.9,
+      "seq_len": 128,
+      "mode": "Ternary",
+      "tok_s": 3.51,
+      "peak_mb": 1159.0,
+      "model_mb": 318.5,
+      "prefill_ms": 353.0,
+      "per_token_ms": 285.1
+    },
+    {
+      "model": "DistilGPT-2 (82M)",
+      "params_m": 81.9,
+      "seq_len": 512,
+      "mode": "Ternary",
+      "tok_s": 5.4,
+      "peak_mb": 1224.0,
+      "model_mb": 318.5,
+      "prefill_ms": 599.4,
+      "per_token_ms": 185.1
+    },
+    {
+      "model": "DistilGPT-2 (82M)",
+      "params_m": 81.9,
+      "seq_len": 128,
+      "mode": "Packed",
+      "tok_s": 1.92,
+      "peak_mb": 1224.0,
+      "model_mb": 171.7,
+      "prefill_ms": 13167.5,
+      "per_token_ms": 519.5
+    },
+    {
+      "model": "DistilGPT-2 (82M)",
+      "params_m": 81.9,
+      "seq_len": 512,
+      "mode": "Packed",
+      "tok_s": 0.57,
+      "peak_mb": 1224.0,
+      "model_mb": 171.7,
+      "prefill_ms": 52398.3,
+      "per_token_ms": 1754.9
+    },
+    {
+      "model": "GPT-2 (124M)",
+      "params_m": 124.4,
+      "seq_len": 128,
+      "mode": "FP32",
+      "tok_s": 37.03,
+      "peak_mb": 1224.0,
+      "model_mb": 486.7,
+      "prefill_ms": 94.6,
+      "per_token_ms": 27.0
+    },
+    {
+      "model": "GPT-2 (124M)",
+      "params_m": 124.4,
+      "seq_len": 512,
+      "mode": "FP32",
+      "tok_s": 26.6,
+      "peak_mb": 1274.0,
+      "model_mb": 486.7,
+      "prefill_ms": 373.9,
+      "per_token_ms": 37.6
+    },
+    {
+      "model": "GPT-2 (124M)",
+      "params_m": 124.4,
+      "seq_len": 128,
+      "mode": "Ternary",
+      "tok_s": 1.74,
+      "peak_mb": 1606.0,
+      "model_mb": 486.7,
+      "prefill_ms": 687.3,
+      "per_token_ms": 573.3
+    },
+    {
+      "model": "GPT-2 (124M)",
+      "params_m": 124.4,
+      "seq_len": 512,
+      "mode": "Ternary",
+      "tok_s": 1.72,
+      "peak_mb": 1678.0,
+      "model_mb": 486.7,
+      "prefill_ms": 1118.2,
+      "per_token_ms": 580.6
+    },
+    {
+      "model": "GPT-2 (124M)",
+      "params_m": 124.4,
+      "seq_len": 128,
+      "mode": "Packed",
+      "tok_s": 0.95,
+      "peak_mb": 1678.0,
+      "model_mb": 193.1,
+      "prefill_ms": 26465.3,
+      "per_token_ms": 1048.5
+    },
+    {
+      "model": "GPT-2 (124M)",
+      "params_m": 124.4,
+      "seq_len": 512,
+      "mode": "Packed",
+      "tok_s": 0.28,
+      "peak_mb": 1678.0,
+      "model_mb": 193.1,
+      "prefill_ms": 105935.8,
+      "per_token_ms": 3534.0
+    },
+    {
+      "model": "GPT-2-medium (355M)",
+      "params_m": 354.8,
+      "seq_len": 128,
+      "mode": "FP32",
+      "tok_s": 13.38,
+      "peak_mb": 2126.0,
+      "model_mb": 1377.5,
+      "prefill_ms": 271.2,
+      "per_token_ms": 74.7
+    },
+    {
+      "model": "GPT-2-medium (355M)",
+      "params_m": 354.8,
+      "seq_len": 512,
+      "mode": "FP32",
+      "tok_s": 8.19,
+      "peak_mb": 2316.0,
+      "model_mb": 1377.5,
+      "prefill_ms": 1036.1,
+      "per_token_ms": 122.1
+    },
+    {
+      "model": "GPT-2-medium (355M)",
+      "params_m": 354.8,
+      "seq_len": 128,
+      "mode": "Ternary",
+      "tok_s": 0.46,
+      "peak_mb": 3404.0,
+      "model_mb": 1377.5,
+      "prefill_ms": 2530.9,
+      "per_token_ms": 2157.3
+    },
+    {
+      "model": "GPT-2-medium (355M)",
+      "params_m": 354.8,
+      "seq_len": 512,
+      "mode": "Ternary",
+      "tok_s": 0.44,
+      "peak_mb": 3547.0,
+      "model_mb": 1377.5,
+      "prefill_ms": 3823.8,
+      "per_token_ms": 2261.1
+    },
+    {
+      "model": "TinyLlama-1.1B",
+      "params_m": 1100.0,
+      "seq_len": 128,
+      "mode": "FP32",
+      "tok_s": 5.84,
+      "peak_mb": 4361.0,
+      "model_mb": 4196.4,
+      "prefill_ms": 674.0,
+      "per_token_ms": 171.2
+    },
+    {
+      "model": "TinyLlama-1.1B",
+      "params_m": 1100.0,
+      "seq_len": 512,
+      "mode": "FP32",
+      "tok_s": 4.02,
+      "peak_mb": 4500.0,
+      "model_mb": 4196.4,
+      "prefill_ms": 2427.2,
+      "per_token_ms": 248.6
+    },
+    {
+      "model": "TinyLlama-1.1B",
+      "params_m": 1100.0,
+      "seq_len": 1024,
+      "mode": "FP32",
+      "tok_s": 2.73,
+      "peak_mb": 4705.0,
+      "model_mb": 4196.4,
+      "prefill_ms": 5087.9,
+      "per_token_ms": 366.1
+    },
+    {
+      "model": "BERT-base (110M)",
+      "params_m": 109.5,
+      "seq_len": 128,
+      "mode": "FP32",
+      "tok_s": null,
+      "peak_mb": 6674.0,
+      "model_mb": 417.6,
+      "prefill_ms": 52.6,
+      "per_token_ms": null
+    },
+    {
+      "model": "BERT-base (110M)",
+      "params_m": 109.5,
+      "seq_len": 512,
+      "mode": "FP32",
+      "tok_s": null,
+      "peak_mb": 6674.0,
+      "model_mb": 417.6,
+      "prefill_ms": 187.3,
+      "per_token_ms": null
+    },
+    {
+      "model": "BERT-base (110M)",
+      "params_m": 109.5,
+      "seq_len": 128,
+      "mode": "Ternary",
+      "tok_s": null,
+      "peak_mb": 6674.0,
+      "model_mb": 417.6,
+      "prefill_ms": 293.6,
+      "per_token_ms": null
+    },
+    {
+      "model": "BERT-base (110M)",
+      "params_m": 109.5,
+      "seq_len": 512,
+      "mode": "Ternary",
+      "tok_s": null,
+      "peak_mb": 6674.0,
+      "model_mb": 417.6,
+      "prefill_ms": 462.2,
+      "per_token_ms": null
+    },
+    {
+      "model": "BERT-base (110M)",
+      "params_m": 109.5,
+      "seq_len": 128,
+      "mode": "Packed",
+      "tok_s": null,
+      "peak_mb": 6674.0,
+      "model_mb": 122.0,
+      "prefill_ms": 27250.0,
+      "per_token_ms": null
+    },
+    {
+      "model": "BERT-base (110M)",
+      "params_m": 109.5,
+      "seq_len": 512,
+      "mode": "Packed",
+      "tok_s": null,
+      "peak_mb": 6674.0,
+      "model_mb": 122.0,
+      "prefill_ms": 108295.2,
+      "per_token_ms": null
+    }
+  ]
+}
