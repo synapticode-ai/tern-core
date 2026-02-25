@@ -848,4 +848,90 @@ python benchmarks/bench_tinyllama.py
 *Mixed-precision evaluation generated 2026-02-25 on the same system.*
 *STE training evaluation generated 2026-02-25 on the same system.*
 *Weight analysis, gradient probe, STE comparison generated 2026-02-25 on the same system.*
-*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`*
+*.tern-model v2 format and serialisation generated 2026-02-25 on the same system.*
+*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`*
+
+---
+
+## Day 6: .tern-model v2 Format and TernModelWriter
+
+### Format Specification
+
+Production binary format for NPU vendor deployment.  Key improvements over v1:
+
+| Feature | v1 (model_loader/) | v2 (tern_model.py) |
+|---------|-------------------|--------------------|
+| Access pattern | Sequential (length-prefixed) | Random access (offset-based manifest) |
+| Alignment | None | 32-byte SIMD boundary |
+| Per-layer metadata | name, type, shape, threshold | + sparsity, sensitivity, quant_error, offset, size |
+| Integrity | SHA-256 (appended) | CRC32 + file_size + reverse magic footer |
+| Header | 18 bytes | 256 bytes (fixed, with reserved space) |
+| Lazy loading | No | Yes (manifest offsets → seek to any layer) |
+
+### File structure
+
+```
+[HEADER]    256 bytes — magic "TERN", version 2, section offsets
+[MANIFEST]  JSON — layer entries with byte offsets, 32-byte aligned
+[WEIGHTS]   Packed ternary (2-bit) + FP16 protected, each layer 32-byte aligned
+[FOOTER]    16 bytes — CRC32 + file_size + reverse magic "NRET"
+```
+
+### TinyLlama v_proj_late3 Integration
+
+| Metric | Value |
+|--------|-------|
+| Original FP32 size | 4,400.2 MB |
+| .tern-model v2 size | 2,066.3 MB |
+| Compression ratio | 2.13x |
+| Ternary layers | 3 (v_proj at layers 19-21) |
+| Protected layers | 152 (FP16) |
+| Write time | 9.7s |
+
+Ternary layer detail:
+
+| Layer | Shape | Sparsity | Alpha |
+|-------|-------|----------|-------|
+| layers.19.self_attn.v_proj | [256, 2048] | 45.1% | 0.027137 |
+| layers.20.self_attn.v_proj | [256, 2048] | 43.7% | 0.027877 |
+| layers.21.self_attn.v_proj | [256, 2048] | 43.5% | 0.030733 |
+
+Compression is 2.13x because 152 of 155 layers are stored as FP16 (2 bytes/weight)
+vs original FP32 (4 bytes/weight). The 3 ternary layers contribute negligible additional
+savings at this config. Higher ternary fractions would increase compression further.
+
+### Test Results
+
+18 new tests in `tests/test_tern_model.py`, all passing:
+
+| Test | Verified |
+|------|----------|
+| `test_pack_ternary_basic` | Known weights → correct 2-bit encoding |
+| `test_pack_ternary_roundtrip` | Pack → unpack bit-identical |
+| `test_pack_ternary_all_zeros` | All-zero → sparsity 1.0 |
+| `test_sparsity_bitmap_all_zero` | Zero blocks → zero bitmap |
+| `test_sparsity_bitmap_nonzero_block` | Non-zero block sets bit |
+| `test_write_single_layer` | Write 1 ternary layer, verify readable |
+| `test_write_mixed_precision` | Write mixed ternary + FP16 |
+| `test_alignment` | All layer offsets 32-byte aligned |
+| `test_header_magic` | Magic "TERN" and version 2 |
+| `test_manifest_readable` | JSON manifest with all required fields |
+| `test_file_integrity` | CRC32 validates on clean file |
+| `test_file_integrity_corrupted` | CRC32 fails on corrupted file |
+| `test_footer_magic` | Reverse magic "NRET" at end |
+| `test_header_size` | Header exactly 256 bytes |
+| `test_file_size_matches` | Footer file_size = actual size |
+| `test_random_access_read` | Read specific layer by name |
+| `test_random_access_missing_layer` | KeyError on missing layer |
+| `test_layer_with_bias` | Bias vector stored correctly |
+
+Total test suite: **102 passed**, 3 skipped (TinyLlama download-dependent).
+
+### Patent Alignment
+
+| Patent | Claim | Implementation |
+|--------|-------|---------------|
+| Patent 6 | Model format | Formal byte-level spec in `docs/tern-model-spec.md` |
+| Patent 8 | Serialisation | `TernModelWriter.write()` with CRC32 integrity footer |
+| Patent 39 | Ternary-native memory | 2-bit packed format (4 weights/byte), 32-byte aligned |
+| Patent 40 | Bandwidth optimisation | Offset-based manifest enables random-access layer loading |
