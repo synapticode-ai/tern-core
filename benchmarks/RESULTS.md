@@ -812,7 +812,7 @@ cd src/terncore/csrc && make clean && make && cd ../../..
 # Run C tests (53 tests)
 cd src/terncore/csrc && make test && cd ../../..
 
-# Run Python tests (148 tests + 3 skipped)
+# Run Python tests (163 tests + 3 skipped)
 pytest tests/ -v
 
 # Run microbenchmark (isolated matmul)
@@ -852,7 +852,8 @@ python benchmarks/bench_tinyllama.py
 *.tern-model round-trip validation generated 2026-02-25 on the same system.*
 *PackedTernaryLinear benchmark generated 2026-02-25 on the same system.*
 *Sparsity bitmap zero-skip benchmark generated 2026-02-25 on the same system.*
-*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`, `benchmarks/bench_day7_roundtrip.py`, `benchmarks/bench_day8_packing.py`, `benchmarks/bench_day9_sparsity.py`*
+*Conversion pipeline benchmark generated 2026-02-25 on the same system.*
+*Benchmark scripts: `benchmarks/bench_stage1b.py`, `benchmarks/bench_tinyllama.py`, `benchmarks/eval_perplexity.py`, `benchmarks/eval_ste_training.py`, `benchmarks/analyse_weights.py`, `benchmarks/analyse_ste_weights.py`, `benchmarks/quick_probe.py`, `benchmarks/bench_day6.py`, `benchmarks/bench_day7_roundtrip.py`, `benchmarks/bench_day8_packing.py`, `benchmarks/bench_day9_sparsity.py`, `benchmarks/bench_day10_pipeline.py`*
 
 ---
 
@@ -1247,3 +1248,159 @@ Total test suite: **148 passed**, 3 skipped (TinyLlama download-dependent).
 | Patent 7 | Sparsity-aware execution | Cached bitmap buffer in PackedTernaryLinear |
 | Patent 9 | Zero-skip optimization | `tern_sparse64_packed_matmul_f32` — 64-weight block skip + CTZ bit-scan |
 | Patent 37 | Zero-weight clock-gating | Block-level skip when all 64 bitmap bits are zero |
+
+---
+
+## Day 10: tern-convert CLI — End-to-End Conversion Pipeline
+
+### Overview
+
+`tern-convert` is the single-command pipeline that wires all Days 1-9 components into
+a production workflow: load HuggingFace model → pattern-based protection → quantise →
+pack 2-bit → generate bitmaps → write .tern-model with manifest.
+
+```bash
+python -m terncore.convert TinyLlama/TinyLlama-1.1B-Chat-v1.0 --output model.tern --verify
+```
+
+This is pure orchestration — no new algorithms.  Every component was built and tested
+independently in prior days.
+
+### Pipeline Stages
+
+| Stage | Component | Source |
+|-------|-----------|--------|
+| 1. Load model | `transformers.AutoModelForCausalLM` | Day 1 |
+| 2. Protection list | Pattern-based (`*embed*`, `*norm*`, `*lm_head*`, `*head*`) | Days 2-5 |
+| 3. Quantise | `TernaryQuantizer.quantize()` | Stage 1A |
+| 4. Pack 2-bit | `pack_ternary_weights()` | Day 6 |
+| 5. Sparsity bitmap | `TernModelWriter.pack_ternary()` | Day 9 |
+| 6. Write .tern-model | `TernModelWriter.write()` | Day 6-7 |
+| 7. Verify (optional) | `TernModelReader.verify()` | Day 7 |
+
+### Synthetic Pipeline Timing
+
+| Metric | Value |
+|--------|-------|
+| Model | SyntheticTransformer (4 blocks, hidden=256) |
+| Parameters | 3,270,656 |
+| Total layers | 35 |
+| Ternary layers | 28 |
+| Protected layers | 7 (embed, norm, head pattern matches) |
+| File size | 2,243 KB |
+| Compression | 5.7x vs FP32 |
+| Pipeline time | 475ms |
+| Throughput | 6,889,510 params/s |
+| Integrity check | PASS |
+
+### Pipeline Scaling
+
+| Hidden | Layers | Parameters | Time (ms) | File Size (KB) | Compression | Throughput (p/s) |
+|--------|--------|-----------|----------|----------------|-------------|-----------------|
+| 64 | 2 | 104,704 | 18.9 | 82 | 5.0x | 5,543,917 |
+| 128 | 4 | 817,664 | 126 | 571 | 5.6x | 6,474,515 |
+| 256 | 4 | 3,270,656 | 477 | 2,243 | 5.7x | 6,860,897 |
+| 512 | 4 | 13,082,624 | 1,939 | 8,927 | 5.7x | 6,748,060 |
+
+Throughput is consistent at ~6.5-6.9M params/s across model sizes.  Compression ratio
+converges to 5.7x as the fraction of protected layers decreases with model depth.
+
+### TinyLlama-1.1B Integration
+
+| Metric | Value |
+|--------|-------|
+| Model | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |
+| Parameters | 1,034,420,224 |
+| Total layers | 155 |
+| Ternary layers | 154 |
+| Protected layers | 1 (lm_head) |
+| Ternary params | 968,884,224 (93.7%) |
+| File size | **471.6 MB** |
+| Compression | **8.4x vs FP32** |
+| Pipeline time | 212.7s (45.8s load + 164.7s convert + 1.6s write) |
+| Integrity check | PASS |
+
+Protection breakdown: Only `lm_head` is an `nn.Linear` that matches protection patterns.
+`model.embed_tokens` is `nn.Embedding` (not Linear — automatically excluded from conversion).
+RMSNorm layers are not `nn.Linear` — also automatically excluded.  The converter only
+operates on `nn.Linear` modules, so non-Linear layers are inherently safe.
+
+File size 471.6 MB vs FP32 4,137 MB = **8.4x compression**.  This is better than the
+theoretical 5.7x from synthetic models because TinyLlama has only 1 protected layer
+(lm_head, 65.5M params) vs 154 ternary layers (968.9M params).  Protected layers stored
+as FP16 (2 bytes/weight) and ternary as 2-bit packed (0.25 bytes/weight + bitmap overhead).
+
+### Round-Trip Correctness
+
+| Metric | Value |
+|--------|-------|
+| Max diff (original vs loaded) | 0.302599 |
+| Mean diff | 0.085922 |
+| NaN values | None |
+
+Non-zero diff is expected: ternary quantisation is lossy.  The output is structurally
+correct (right shape, no NaN/Inf, reasonable magnitude).
+
+### CLI Features
+
+| Flag | Description |
+|------|-------------|
+| `MODEL_ID` | HuggingFace model ID or local path |
+| `-o, --output` | Output .tern-model path (required) |
+| `-t, --threshold` | Quantisation threshold (default: 0.7) |
+| `--protect` | Additional glob patterns to protect |
+| `--info` | Show model config without converting |
+| `--verify` | CRC32 integrity check after conversion |
+| `-q, --quiet` | Suppress progress output |
+
+### Protection Logic
+
+Always-protected patterns (cannot be overridden):
+- `*embed*` — embedding layers
+- `*norm*` — LayerNorm / RMSNorm
+- `*lm_head*` — output projection
+
+Default additional patterns:
+- `*head*` — classifier heads
+
+Users can add patterns with `--protect "*.q_proj*" "*.k_proj*"` etc.
+
+### Test Results
+
+15 new tests in `tests/test_convert.py`, all passing:
+
+| Test | Verified |
+|------|----------|
+| `test_convert_synthetic_model` | End-to-end synthetic model conversion |
+| `test_protection_patterns` | Default patterns protect embed/lm_head |
+| `test_protection_always_protects_critical` | Critical layers protected even with empty patterns |
+| `test_convert_stats_returned` | Comprehensive stats dict returned |
+| `test_output_file_loadable` | Output readable by TernModelReader |
+| `test_round_trip_synthetic` | Convert → load → forward produces valid output |
+| `test_all_linear_layers_converted` | Unprotected Linear → ternary2 |
+| `test_convert_with_bias` | Bias layers converted correctly |
+| `test_transformer_protection` | Transformer-like model: correct embed/norm/head protection |
+| `test_verify_output` | verify() validates output CRC32 |
+| `test_compression_ratio` | Reasonable compression for mixed precision |
+| `test_custom_protection_patterns` | User patterns add to always-protected |
+| `test_per_layer_stats` | Per-layer metadata includes sparsity/alpha |
+| `test_cli_help` | --help works |
+| `test_cli_missing_output` | Errors on missing --output |
+
+Total test suite: **163 passed**, 3 skipped (TinyLlama download-dependent).
+
+### What This Enables
+
+- Day 11: Multi-model benchmark uses tern-convert to process 4+ model families
+- Day 14: NPU readiness validation uses .tern-model files from this pipeline
+- NPU vendors: one command to convert any HuggingFace model → .tern-model
+
+### Patent Alignment
+
+| Patent | Claim | Implementation |
+|--------|-------|---------------|
+| Patent 10 | Automated conversion | `TernaryConverter.convert()` — full pipeline orchestration |
+| Patent 11 | Protection identification | Pattern-based `_build_protection_list()` with always-protected |
+| Patent 12 | Binary-to-ternary pipeline | CLI: `python -m terncore.convert MODEL --output FILE` |
+| Patent 6 | Model format | Output is v2 .tern-model with manifest, CRC32 footer |
+| Patent 8 | Serialisation integrity | `--verify` flag validates output via `TernModelReader.verify()` |
