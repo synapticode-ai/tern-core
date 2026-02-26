@@ -117,6 +117,12 @@ class TernaryQuantizer:
 
         Useful for sensitivity analysis (Patent 4): determine which layers
         tolerate ternary quantisation and which need protection.
+
+        Args:
+            weights: Floating-point weight tensor of any shape.
+
+        Returns:
+            ``QuantisationStats`` with sparsity, alpha, and reconstruction MSE.
         """
         ternary, alpha = self.quantize(weights)
         reconstructed = self.dequantize(ternary, alpha)
@@ -168,6 +174,10 @@ class SensitivityAnalyzer:
         """
         Evaluate a single layer across multiple thresholds.
 
+        Args:
+            name: Layer name (for labelling in results).
+            weights: FP32 weight tensor to analyse.
+
         Returns:
             Dict with layer name, best threshold, stats at each threshold,
             and whether the layer is precision-critical.
@@ -201,6 +211,9 @@ class SensitivityAnalyzer:
     def analyze_model(self, model: nn.Module) -> list[dict]:
         """
         Analyse all Linear and Conv2d layers in a model.
+
+        Args:
+            model: PyTorch model to analyse.
 
         Returns:
             List of per-layer analysis dicts, sorted by reconstruction MSE

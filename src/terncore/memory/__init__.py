@@ -12,6 +12,11 @@ from __future__ import annotations
 import torch
 from dataclasses import dataclass
 
+__all__ = [
+    "MemoryProfile",
+    "profile_model_memory",
+]
+
 
 @dataclass
 class MemoryProfile:

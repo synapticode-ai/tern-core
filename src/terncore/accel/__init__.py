@@ -40,6 +40,12 @@ from terncore.sparse import pack_ternary_weights
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "TernaryLinearAccel",
+    "is_accelerated",
+    "get_acceleration_info",
+]
+
 
 # ═══════════════════════════════════════════════════════════════
 # Library loading

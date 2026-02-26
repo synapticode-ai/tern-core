@@ -19,6 +19,7 @@ checkpointing, batch size 1 with gradient accumulation.
 from __future__ import annotations
 
 import gc
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -28,6 +29,8 @@ import torch.nn as nn
 
 from terncore.ste import TernaryLinearSTE
 from terncore.engine.inference import TernaryInferenceEngine
+
+logger = logging.getLogger(__name__)
 
 
 PROTECT_PATTERNS = (
@@ -218,10 +221,9 @@ class STETrainer:
 
             # Log progress
             if not quiet and (step % self.log_every == 0 or step == 1 or step == num_steps):
-                print(
-                    f"  Step {step:>4}/{num_steps} | "
-                    f"loss={avg_loss:.4f} | "
-                    f"time={t_elapsed:.1f}s"
+                logger.info(
+                    "  Step %4d/%d | loss=%.4f | time=%.1fs",
+                    step, num_steps, avg_loss, t_elapsed,
                 )
 
             accum_loss = 0.0

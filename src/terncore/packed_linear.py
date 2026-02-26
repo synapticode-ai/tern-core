@@ -285,6 +285,7 @@ class PackedTernaryLinear(nn.Module):
         }
 
     def extra_repr(self) -> str:
+        """Return string representation for ``print(module)``."""
         s = f"in_features={self.in_features}, out_features={self.out_features}"
         s += f", bias={self.bias is not None}"
         fp = self.memory_footprint()

@@ -33,6 +33,11 @@ from typing import Optional, Any
 from terncore.arithmetic.linear import TernaryLinear, TernaryConv2d
 from terncore.sparse import pack_ternary_weights, unpack_ternary_weights
 
+__all__ = [
+    "TernModelWriter",
+    "TernModelReader",
+]
+
 # Magic bytes: "TERN" in ASCII
 TERN_MAGIC = b"TERN"
 TERN_VERSION = 1

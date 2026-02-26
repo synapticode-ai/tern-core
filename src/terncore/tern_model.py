@@ -488,7 +488,8 @@ class TernModelReader:
         """
         Verify file integrity using footer CRC32 and file size.
 
-        Returns True if all checks pass.
+        Returns:
+            True if reverse magic, file size, and CRC32 all match.
         """
         file_size = self.path.stat().st_size
 
@@ -672,19 +673,42 @@ class TernModelReader:
     # ── Lazy loading convenience API ────────────────────────────
 
     def layer(self, name: str) -> torch.Tensor:
-        """Load and reconstruct a single layer's weight tensor on demand."""
+        """Load and reconstruct a single layer's weight tensor on demand.
+
+        Args:
+            name: Layer name from the manifest.
+
+        Returns:
+            Reconstructed FP32 weight tensor.
+        """
         return self.reconstruct_layer(name)["weight"]
 
     def load_all(self) -> dict[str, torch.Tensor]:
-        """Load all layers as a state_dict. Alias for reconstruct_all()."""
+        """Load all layers as a state_dict. Alias for reconstruct_all().
+
+        Returns:
+            Dict mapping ``"layer.name.weight"`` to reconstructed tensors.
+        """
         return self.reconstruct_all()
 
     def layer_names(self) -> list[str]:
-        """List all layer names from the manifest (no weight loading)."""
+        """List all layer names from the manifest (no weight loading).
+
+        Returns:
+            List of layer name strings in manifest order.
+        """
         return [entry["name"] for entry in self.manifest["layers"]]
 
     def layer_info(self, name: str) -> dict:
-        """Get manifest metadata for a layer without loading weights."""
+        """Get manifest metadata for a layer without loading weights.
+
+        Args:
+            name: Layer name from the manifest.
+
+        Returns:
+            Dict with dtype, shape, num_params, offset, size, and
+            dtype-specific fields (threshold, alpha, sparsity for ternary).
+        """
         return dict(self._get_manifest_entry(name))
 
     # ── Packed loading ──────────────────────────────────────────

@@ -21,6 +21,16 @@ import torch
 from dataclasses import dataclass
 from typing import Tuple
 
+__all__ = [
+    "SparsityInfo",
+    "generate_sparsity_bitmap",
+    "pack_ternary_weights",
+    "unpack_ternary_weights",
+    "analyze_block_sparsity",
+    "model_sparsity_report",
+    "sparsity_info",
+]
+
 
 @dataclass
 class SparsityInfo:
@@ -244,7 +254,15 @@ def model_sparsity_report(model) -> list[dict]:
 
 
 def sparsity_info(ternary_weights: torch.Tensor) -> SparsityInfo:
-    """Calculate sparsity statistics for a ternary weight tensor."""
+    """Calculate sparsity statistics for a ternary weight tensor.
+
+    Args:
+        ternary_weights: Tensor with values in {-1, 0, +1}.
+
+    Returns:
+        ``SparsityInfo`` with total/zero/nonzero counts, sparsity ratio,
+        and estimated memory savings vs FP16.
+    """
     total = ternary_weights.numel()
     zeros = (ternary_weights == 0).sum().item()
     nonzeros = total - zeros

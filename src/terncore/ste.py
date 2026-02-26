@@ -43,6 +43,20 @@ class STEQuantize(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, weights: torch.Tensor, threshold: float) -> torch.Tensor:
+        """Quantise weights to ternary and scale by alpha.
+
+        Produces identical output to ``TernaryQuantizer.quantize()`` followed
+        by ``dequantize()`` — this is a hard requirement for training/inference
+        consistency.
+
+        Args:
+            ctx: Autograd context (used to save tensors for backward).
+            weights: FP32 latent weight tensor of any shape.
+            threshold: Quantisation threshold in (0, 1).
+
+        Returns:
+            Dequantised tensor (ternary * alpha), same shape as weights.
+        """
         # Exact same computation as TernaryQuantizer.quantize()
         abs_w = torch.abs(weights)
         delta = threshold * torch.mean(abs_w)
@@ -70,8 +84,16 @@ class STEQuantize(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        # Straight-through: pass gradient unchanged to latent weights
-        # None for the threshold argument (not a tensor, no gradient)
+        """Straight-through estimator: pass gradient unchanged.
+
+        Args:
+            ctx: Autograd context.
+            grad_output: Gradient from downstream layers.
+
+        Returns:
+            Tuple of (grad_weights, None) — None for the threshold
+            argument which is not a tensor and has no gradient.
+        """
         return grad_output, None
 
 
@@ -115,7 +137,14 @@ class TernaryLinearSTE(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: quantise weights via STE, then linear transform."""
+        """Forward pass: quantise weights via STE, then linear transform.
+
+        Args:
+            x: Input tensor of shape ``(*, in_features)``.
+
+        Returns:
+            Output tensor of shape ``(*, out_features)``.
+        """
         q_weight = STEQuantize.apply(self.weight, self.threshold)
         return F.linear(x, q_weight, self.bias)
 
@@ -125,6 +154,13 @@ class TernaryLinearSTE(nn.Module):
         Create from an existing nn.Linear, copying weights and bias.
 
         Use this to convert a pretrained model's layers for QAT.
+
+        Args:
+            linear: Source ``nn.Linear`` layer.
+            threshold: Quantisation threshold (default 0.7).
+
+        Returns:
+            New ``TernaryLinearSTE`` with copied weights.
         """
         has_bias = linear.bias is not None
         ste = cls(
@@ -144,6 +180,9 @@ class TernaryLinearSTE(nn.Module):
 
         Call this after QAT is complete. The resulting TernaryLinear will
         use cached ternary weights for fast inference.
+
+        Returns:
+            Frozen ``TernaryLinear`` with pre-cached ternary weights.
         """
         tl = TernaryLinear(
             self.in_features,
@@ -162,7 +201,9 @@ class TernaryLinearSTE(nn.Module):
         """
         Verify that STE forward produces identical output to TernaryQuantizer.
 
-        Returns True if the quantised weights match exactly.
+        Returns:
+            True if the STE-quantised weights are bit-identical to
+            ``TernaryQuantizer.quantize()`` output.
         """
         q = TernaryQuantizer(threshold=self.threshold)
         ternary, alpha = q.quantize(self.weight.data)
@@ -175,7 +216,11 @@ class TernaryLinearSTE(nn.Module):
 
     @property
     def sparsity(self) -> float:
-        """Fraction of weights that are currently zero after quantisation."""
+        """Fraction of weights that are currently zero after quantisation.
+
+        Returns:
+            Float in [0, 1] representing the zero-weight ratio.
+        """
         with torch.no_grad():
             abs_w = torch.abs(self.weight.data)
             delta = self.threshold * torch.mean(abs_w)
@@ -183,6 +228,7 @@ class TernaryLinearSTE(nn.Module):
             return zeros.item() / self.weight.numel()
 
     def extra_repr(self) -> str:
+        """Return string representation for ``print(module)``."""
         s = f"in_features={self.in_features}, out_features={self.out_features}"
         s += f", bias={self.bias is not None}"
         s += f", threshold={self.threshold}"
