@@ -1,13 +1,8 @@
-Copyright (c) 2026 Synapticode Co., Ltd.
+Copyright (c) 2026 Robert Lakelin. All rights reserved.
 
-All rights reserved.
+This software is proprietary and confidential. Unauthorised copying,
+modification, distribution, or use of this software, via any medium,
+is strictly prohibited.
 
-This software and associated documentation files (the "Software") are the
-proprietary and confidential property of Synapticode Co., Ltd. No part of
-the Software may be reproduced, distributed, or transmitted in any form or
-by any means without the prior written permission of Synapticode Co., Ltd.
-
-The Software is protected by patent rights. See the accompanying patent
-documentation for details.
-
-For licensing enquiries: partnerships@synapticode.ai
+Patent Notice: This software implements technology described in the
+Synapticode patent portfolio. See docs/PATENT_CODE_MAP.md for details.

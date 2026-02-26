@@ -4,12 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "terncore"
-version = "0.1.0"
-description = "Ternary execution engine for NPU inference — CNS Synaptic™ by Synapticode"
+version = "0.4.0"
+description = "Ternary execution engine for neural network inference"
 readme = "README.md"
-license = {text = "Proprietary — Synapticode Co., Ltd."}
+license = {text = "Proprietary"}
 requires-python = ">=3.10"
-authors = [{name = "Synapticode"}]
+authors = [
+    {name = "Robert Lakelin"},
+]
+keywords = ["ternary", "quantization", "neural-network", "inference", "npu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Private :: Do Not Upload",
+]
 
 dependencies = [
     "torch>=2.0.0",

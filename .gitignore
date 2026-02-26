@@ -8,12 +8,16 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.tern
 *.tern-model
+models/
 .env
 .venv/
 venv/
 wandb/
 *.log
+.DS_Store
+/*.csv
 
 # C build artifacts
 *.o
