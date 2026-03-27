@@ -1,0 +1,114 @@
+{
+  "benchmark": "Terncore CoreML/ANE \u2014 Ternary linear stack",
+  "timestamp": "2026-03-27T01:38:44.498187+00:00",
+  "hardware": "Apple M4 Pro",
+  "config": {
+    "num_blocks": 22,
+    "layers_per_block": 7,
+    "input_shape": [
+      1,
+      64,
+      2048
+    ],
+    "warmup_runs": 10,
+    "benchmark_runs": 50
+  },
+  "quantization": {
+    "n_layers": 154,
+    "total_params": 968884224,
+    "avg_sparsity": 0.35006817059927864
+  },
+  "results": {
+    "pytorch_mps_fp16": {
+      "label": "PyTorch MPS FP16",
+      "compute_units": "MPS (Metal)",
+      "latency_mean_ms": 26.986725799215492,
+      "latency_median_ms": 27.229790997807868,
+      "latency_min_ms": 26.099124996108003,
+      "latency_stdev_ms": 0.5588919729232456,
+      "process_rss_mb": 1503.234375
+    },
+    "coreml_fp16_all": {
+      "label": "CoreML FP16 (ALL)",
+      "compute_units": "ComputeUnit.ALL",
+      "latency_mean_ms": 15.164944998978171,
+      "latency_median_ms": 15.150437498959946,
+      "latency_min_ms": 14.814707996265497,
+      "latency_stdev_ms": 0.16719585810783863,
+      "process_rss_mb": 2563.484375
+    },
+    "coreml_fp16_cpu_and_ne": {
+      "label": "CoreML FP16 (CPU_AND_NE)",
+      "compute_units": "ComputeUnit.CPU_AND_NE",
+      "latency_mean_ms": 15.1390108394844,
+      "latency_median_ms": 15.117999999347376,
+      "latency_min_ms": 14.878374997351784,
+      "latency_stdev_ms": 0.14003852557182164,
+      "process_rss_mb": 2563.765625
+    },
+    "coreml_fp16_cpu_and_gpu": {
+      "label": "CoreML FP16 (CPU_AND_GPU)",
+      "compute_units": "ComputeUnit.CPU_AND_GPU",
+      "latency_mean_ms": 24.780596659547882,
+      "latency_median_ms": 24.8812914978771,
+      "latency_min_ms": 23.76791700226022,
+      "latency_stdev_ms": 0.5376368420844146,
+      "process_rss_mb": 3326.546875
+    },
+    "pytorch_mps_ternary": {
+      "label": "PyTorch MPS Ternary",
+      "compute_units": "MPS (Metal)",
+      "latency_mean_ms": 27.001487460074713,
+      "latency_median_ms": 27.176395498827333,
+      "latency_min_ms": 25.885750001179986,
+      "latency_stdev_ms": 0.5803511356058335,
+      "process_rss_mb": 1600.125
+    },
+    "coreml_ternary_fp16_all": {
+      "label": "CoreML Ternary-FP16 (ALL)",
+      "compute_units": "ComputeUnit.ALL",
+      "latency_mean_ms": 15.11150748032378,
+      "latency_median_ms": 15.10047950068838,
+      "latency_min_ms": 14.803833000769373,
+      "latency_stdev_ms": 0.1562583625761832,
+      "process_rss_mb": 1587.03125
+    },
+    "coreml_ternary_2bit_all": {
+      "label": "CoreML Ternary-2bit (ALL)",
+      "compute_units": "ComputeUnit.ALL",
+      "latency_mean_ms": 7.290400039200904,
+      "latency_median_ms": 7.265666998137021,
+      "latency_min_ms": 7.183292000263464,
+      "latency_stdev_ms": 0.07944869258245271,
+      "process_rss_mb": 720.96875
+    },
+    "coreml_ternary_2bit_cpu_and_ne": {
+      "label": "CoreML Ternary-2bit (CPU_AND_NE)",
+      "compute_units": "ComputeUnit.CPU_AND_NE",
+      "latency_mean_ms": 7.496622600010596,
+      "latency_median_ms": 7.396437500574393,
+      "latency_min_ms": 7.191625001723878,
+      "latency_stdev_ms": 0.25083720300505896,
+      "process_rss_mb": 721.0
+    },
+    "coreml_ternary_2bit_cpu_and_gpu": {
+      "label": "CoreML Ternary-2bit (CPU_AND_GPU)",
+      "compute_units": "ComputeUnit.CPU_AND_GPU",
+      "latency_mean_ms": 33.34543675999157,
+      "latency_median_ms": 33.3872289993451,
+      "latency_min_ms": 31.67487500468269,
+      "latency_stdev_ms": 0.7075828644925289,
+      "process_rss_mb": 731.078125
+    }
+  },
+  "power": {
+    "mps_fp16": {},
+    "ane_ternary_2bit": {},
+    "gpu_ternary_2bit": {}
+  },
+  "model_sizes_mb": {
+    "fp16": 1804.1,
+    "ternary_fp16": 1804.1,
+    "ternary_2bit": 225.6
+  }
+}
