@@ -29,7 +29,25 @@ __all__ = [
     "analyze_block_sparsity",
     "model_sparsity_report",
     "sparsity_info",
+    # Channel pruning (structured sparsity for ANE)
+    "ChannelPruneStats",
+    "score_channel_importance",
+    "detect_prunable_channels",
+    "prune_linear_output",
+    "prune_linear_input",
+    "prune_mlp_channels",
+    "prune_attention_channels",
 ]
+
+from terncore.sparse.channel_pruning import (  # noqa: E402
+    ChannelPruneStats,
+    score_channel_importance,
+    detect_prunable_channels,
+    prune_linear_output,
+    prune_linear_input,
+    prune_mlp_channels,
+    prune_attention_channels,
+)
 
 
 @dataclass

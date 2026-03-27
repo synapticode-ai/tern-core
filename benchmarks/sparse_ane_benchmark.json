@@ -1,0 +1,71 @@
+{
+  "timestamp": "2026-03-27T13:29:50.468614",
+  "hardware": "Apple M4 Pro",
+  "config": {
+    "num_blocks": 22,
+    "input_shape": [
+      1,
+      64,
+      2048
+    ],
+    "warmup": 10,
+    "benchmark_runs": 50
+  },
+  "results": {
+    "dense_2bit": {
+      "label": "Dense Ternary 2-bit (ANE)",
+      "latency_mean_ms": 7.298367540643085,
+      "latency_median_ms": 7.2864585017669015,
+      "latency_min_ms": 7.193541998276487,
+      "latency_stdev_ms": 0.07782303344522683
+    },
+    "sparse_mlp20_attn10": {
+      "label": "Sparse 20% MLP / 10% attn (ANE)",
+      "latency_mean_ms": 6.099147440691013,
+      "latency_median_ms": 6.104313004470896,
+      "latency_min_ms": 6.01900000765454,
+      "latency_stdev_ms": 0.03950326315567723,
+      "params": 798302208,
+      "param_reduction": 0.1760602678571429,
+      "model_size_mb": 184.92283248901367,
+      "mlp_prune": 0.2,
+      "attn_prune": 0.1
+    },
+    "sparse_mlp30_attn20": {
+      "label": "Sparse 30% MLP / 20% attn (ANE)",
+      "latency_mean_ms": 5.304364160110708,
+      "latency_median_ms": 5.307145998813212,
+      "latency_min_ms": 5.233874995610677,
+      "latency_stdev_ms": 0.043743116955009195,
+      "params": 703729664,
+      "param_reduction": 0.27367001488095233,
+      "model_size_mb": 162.37357711791992,
+      "mlp_prune": 0.3,
+      "attn_prune": 0.2
+    },
+    "sparse_mlp40_attn30": {
+      "label": "Sparse 40% MLP / 30% attn (ANE)",
+      "latency_mean_ms": 5.39848837943282,
+      "latency_median_ms": 4.823604504053947,
+      "latency_min_ms": 4.690874993684702,
+      "latency_stdev_ms": 1.7625095593442337,
+      "params": 609157120,
+      "param_reduction": 0.37127976190476186,
+      "model_size_mb": 139.82419967651367,
+      "mlp_prune": 0.4,
+      "attn_prune": 0.3
+    },
+    "sparse_mlp50_attn40": {
+      "label": "Sparse 50% MLP / 40% attn (ANE)",
+      "latency_mean_ms": 4.107533319911454,
+      "latency_median_ms": 4.0876460043364204,
+      "latency_min_ms": 4.030584008432925,
+      "latency_stdev_ms": 0.05313088997770672,
+      "params": 514449408,
+      "param_reduction": 0.4690290178571429,
+      "model_size_mb": 117.24265670776367,
+      "mlp_prune": 0.5,
+      "attn_prune": 0.4
+    }
+  }
+}
