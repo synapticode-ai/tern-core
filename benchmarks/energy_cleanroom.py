@@ -40,7 +40,7 @@ SETTLE_TIME_S = 5                # settle between workloads
 
 # Paths
 REPO_ROOT = Path(__file__).parent.parent
-MODELS_DIR = REPO_ROOT / "tern-core" / "output" / "coreml_models"
+MODELS_DIR = REPO_ROOT / "output" / "coreml_models"
 OUTPUT_DIR = Path(__file__).parent
 INPUT_SHAPE = (1, 64, 2048)
 
