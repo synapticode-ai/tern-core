@@ -10,6 +10,8 @@ build/
 .ruff_cache/
 *.tern
 *.tern-model
+*.pt
+*.safetensors
 models/
 .env
 .venv/

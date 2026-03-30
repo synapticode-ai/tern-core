@@ -1,0 +1,52 @@
+{
+  "benchmark": "clean-room ANE energy benchmark",
+  "hardware": "Apple M4 Pro",
+  "date": "2026-03-28T08:25:00Z",
+  "input_shape": [1, 64, 2048],
+  "seq_len": 64,
+  "power_sample_interval_ms": 500,
+  "models": {
+    "fp16": {"size_mb": 1804.1, "format": "CoreML .mlpackage"},
+    "ternary_2bit": {"size_mb": 225.6, "format": "CoreML .mlpackage"}
+  },
+  "compression_ratio": 8.0,
+  "idle_baseline": {
+    "ane_w": 0.000,
+    "cpu_w": 0.765,
+    "gpu_w": 0.040
+  },
+  "results": [
+    {
+      "backend": "fp16_ane",
+      "ane_w": 5.368,
+      "cpu_w": 0.680,
+      "gpu_w": 0.045,
+      "latency_ms": 15.53,
+      "tokens_per_sec": 4120,
+      "tokens_per_watt": 768
+    },
+    {
+      "backend": "ternary_2bit_ane",
+      "ane_w": 6.766,
+      "cpu_w": 0.600,
+      "gpu_w": 0.051,
+      "latency_ms": 7.53,
+      "tokens_per_sec": 8504,
+      "tokens_per_watt": 1257
+    },
+    {
+      "backend": "fp16_gpu",
+      "ane_w": 0.000,
+      "cpu_w": 1.586,
+      "gpu_w": 16.461,
+      "latency_ms": 24.84,
+      "tokens_per_sec": 2576,
+      "tokens_per_watt": 141
+    }
+  ],
+  "summary": {
+    "speedup": "2.1x",
+    "energy_efficiency_gain": "1.64x",
+    "model_compression": "8.0x"
+  }
+}

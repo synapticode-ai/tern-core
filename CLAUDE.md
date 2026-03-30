@@ -132,4 +132,7 @@ PyTorch model (FP16)
 
 ## Licence
 
-tern-sdk is Apache 2.0. All other repositories are proprietary (Synapticode Co., Ltd.). Never commit model files (*.tern-model, *.pt, *.safetensors, etc.).
+tern-sdk is released under an evaluation licence pending 
+commercial terms. All repositories are proprietary — 
+copyright Robert Lakelin, Australia. 
+Never commit model files (*.tern-model, *.pt, *.safetensors).

@@ -5,6 +5,11 @@ Converts a model to ternary while protecting specified layers in their
 original precision (FP32/FP16).  Uses per-layer sensitivity analysis
 results to determine which layers benefit most from protection.
 
+When ``auto=True`` (the default) and no ``protection_list`` is given,
+a perplexity-gated scan automatically determines which layers can be
+safely converted.  Results are cached to ``~/.terncore/model_cache.json``
+so repeat runs skip the scan.
+
 Patent 4: Progressive Compression — iterative protection search for
           mixed-precision ternary/FP16 deployment.
 Patent 12: Auto binary-to-ternary conversion.
@@ -29,7 +34,11 @@ class MixedPrecisionConverter:
     layers stay in their original precision; all other eligible Linear
     layers are converted to ternary {-1, 0, +1}.
 
-    Usage:
+    Usage — automatic (recommended):
+        converter = MixedPrecisionConverter(threshold=0.7)
+        report = converter.convert(model, model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    Usage — explicit protection list:
         converter = MixedPrecisionConverter(
             threshold=0.7,
             protection_list=["model.layers.2.mlp.down_proj"],
@@ -47,38 +56,75 @@ class MixedPrecisionConverter:
         protect_embeddings: bool = True,
         protect_layernorm: bool = True,
         protect_lm_head: bool = True,
+        auto: bool = True,
+        ppl_headroom: float = 0.20,
     ) -> None:
         """
         Args:
             threshold:         Quantisation threshold for ternary layers.
             protection_list:   Layer names to keep in original precision.
+                               When provided, auto-scan is skipped.
             protect_embeddings: Keep embedding layers in FP16 (default True).
             protect_layernorm:  Keep LayerNorm/RMSNorm in FP32 (default True).
             protect_lm_head:    Keep final output projection in FP16 (default True).
+            auto:              Run a perplexity-gated scan to find safe layers
+                               automatically when no protection_list is given
+                               (default True).
+            ppl_headroom:      Maximum allowed PPL increase as a fraction when
+                               auto-scanning (default 0.20 = 20%).
         """
         self.threshold = threshold
-        self.protection_list = set(protection_list or [])
+        self.protection_list = set(protection_list) if protection_list is not None else None
         self.protect_embeddings = protect_embeddings
         self.protect_layernorm = protect_layernorm
         self.protect_lm_head = protect_lm_head
+        self.auto = auto
+        self.ppl_headroom = ppl_headroom
+        self._scan_result = None
+        # Track whether an explicit list was provided
+        self._explicit_protection = protection_list is not None
 
-    def convert(self, model: nn.Module) -> ConversionReport:
+    @property
+    def scan_result(self):
+        """The ScanResult from the last auto-scan, or None."""
+        return self._scan_result
+
+    def convert(
+        self,
+        model: nn.Module,
+        model_id: Optional[str] = None,
+    ) -> ConversionReport:
         """
         Convert model to mixed-precision ternary in-place.
 
-        Protected layers (from protection_list + default patterns) keep
-        their original weights.  All other nn.Linear layers are replaced
-        with TernaryLinear using the configured threshold.
-
-        Uses TernaryInferenceEngine static methods for the actual
-        Linear -> TernaryLinear conversion and module replacement.
+        Protected layers (from protection_list, auto-scan, or default
+        patterns) keep their original weights.  All other nn.Linear
+        layers are replaced with TernaryLinear.
 
         Args:
-            model: PyTorch model to convert in-place.
+            model:    PyTorch model to convert in-place.
+            model_id: HuggingFace model ID (required for auto-scan,
+                      ignored when an explicit protection_list was given).
 
         Returns:
             ConversionReport with layer counts, param stats, compression.
         """
+        # Auto-scan if no explicit protection list was provided
+        if not self._explicit_protection and self.auto and model_id is not None:
+            from terncore.autoscan import auto_scan
+            scan = auto_scan(
+                model_id,
+                threshold=self.threshold,
+                ppl_headroom=self.ppl_headroom,
+            )
+            self._scan_result = scan
+            self.protection_list = set(scan.protection_list)
+
+        # Ensure protection_list is a set (may still be None if auto was off
+        # and nothing was provided)
+        if self.protection_list is None:
+            self.protection_list = set()
+
         report = ConversionReport()
         report.precision_critical_layers = sorted(self.protection_list)
 

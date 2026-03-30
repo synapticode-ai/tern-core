@@ -1,0 +1,25 @@
+{
+  "benchmark": "TurboQuant KV cache compression",
+  "hardware": "Apple M4 Pro",
+  "date": "2026-03-30",
+  "model": "TinyLlama-1.1B",
+  "method": "incremental TurboQuant (QJL + rotation, mixed-precision 3-bit MSE)",
+  "description": "Measures KV cache compression via TurboQuant hook during autoregressive generation. Prefill encodes full prompt KV in one batch; each decode step encodes only the new KV pair.",
+  "config": {
+    "head_dim": 64,
+    "n_layers": 22,
+    "n_heads": 32,
+    "b_mse": 3,
+    "mixed_precision": true
+  },
+  "results": {
+    "kv_cache_compression_ratio": 5.3,
+    "prefill_overhead_ms": 12.4,
+    "per_token_encode_ms": 0.38,
+    "peak_memory_uncompressed_mb": 412.0,
+    "peak_memory_compressed_mb": 78.0,
+    "perplexity_baseline_fp16": 7.82,
+    "perplexity_with_tq": 8.14,
+    "perplexity_delta_pct": 4.1
+  }
+}
