@@ -9,7 +9,7 @@ All arithmetic is compare-and-add. No multiply-accumulate.
 Determinism is non-negotiable: same input + same model = bit-identical output.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from terncore.arithmetic.quantizer import TernaryQuantizer
 from terncore.arithmetic.linear import TernaryLinear
@@ -22,6 +22,10 @@ from terncore.confidence import RoutingConfidence, stack_confidence
 from terncore.routing import TernaryRouter, RouteDecision
 from terncore.queue import ConfidenceQueue, QueuedRoute, ReleasedRoute, ReleaseReason
 from terncore.meta import MetaAgent, UncertaintyReport, ResolutionStrategy
+
+# v0.3.0 — Model Routing
+from terncore.model_router import TernaryModelRouter, ModelSpec, ModelResponse
+from terncore.model_specs import tinyllama_spec, mistral_spec
 
 __all__ = [
     # v0.1.0 — Ternary execution engine
@@ -44,4 +48,10 @@ __all__ = [
     "MetaAgent",
     "UncertaintyReport",
     "ResolutionStrategy",
+    # v0.3.0 — Model routing
+    "TernaryModelRouter",
+    "ModelSpec",
+    "ModelResponse",
+    "tinyllama_spec",
+    "mistral_spec",
 ]
