@@ -37,6 +37,7 @@ from terncore.cube import (
     validate_address,
 )
 from terncore.persistence import GuardianPersistence, CubeySessionPersistence
+from terncore.analytics import analyze as guardian_analyze, GuardianAnalytics, AnalyticsWindow
 
 __all__ = [
     # v0.1.0 — Ternary execution engine
@@ -75,4 +76,8 @@ __all__ = [
     # v0.4.1 — Persistence
     "GuardianPersistence",
     "CubeySessionPersistence",
+    # v0.4.2 — Analytics
+    "guardian_analyze",
+    "GuardianAnalytics",
+    "AnalyticsWindow",
 ]
