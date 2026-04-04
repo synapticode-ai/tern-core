@@ -51,6 +51,11 @@ CUBE_ADDRESS_SPACE: dict[str, list[str]] = {
         "loyalty", "cx", "recommendations",
         "returns_refunds", "nps", "escalations",
     ],
+    "hr": [
+        "roster", "onboarding", "probation",
+        "performance", "hr", "payroll_hr",
+        "offboarding", "compliance_hr", "training",
+    ],
 }
 
 ALL_DOMAINS = list(CUBE_ADDRESS_SPACE.keys())
