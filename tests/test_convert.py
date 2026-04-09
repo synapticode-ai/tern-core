@@ -115,7 +115,12 @@ class TestTernaryConverter:
             assert stats["total_layers"] > 0
             assert stats["ternary_layers"] > 0
             assert stats["file_size_bytes"] > 0
-            assert stats["conversion_time_seconds"] > 0
+            # >= 0 not > 0: a synthetic SimpleMLP can convert faster than
+            # the timer's smallest representable delta on Apple Silicon,
+            # so 0.0 is a legitimate "successful conversion that took
+            # essentially no time" reading. The timer is being honest;
+            # the assertion was being unrealistic.
+            assert stats["conversion_time_seconds"] >= 0
         finally:
             Path(path).unlink(missing_ok=True)
 
