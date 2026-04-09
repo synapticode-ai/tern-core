@@ -41,6 +41,9 @@ transformers = [
     "accelerate>=0.20.0",
     "sentencepiece>=0.1.99",
 ]
+harness = [
+    "mlx>=0.18",
+]
 
 [project.scripts]
 tern-convert = "terncore.convert:main"
