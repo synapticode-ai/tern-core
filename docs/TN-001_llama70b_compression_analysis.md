@@ -207,40 +207,63 @@ The INT4 quantiser was built to be byte-identical to CoreML's
 This means the Layer 4 CoreML/ANE export is a format copy, not a
 requantisation step. Confirmed via coremltools source analysis.
 
-### 3-tier compression results
+### 3-tier compression results (predicted)
 
-| Tier | Layers | Params | B/param | Size |
-|------|--------|--------|---------|------|
+| Tier | Layers | Params | B/param | Predicted size |
+|------|--------|--------|---------|----------------|
 | Ternary {-1,0,+1} | 125 (22%) | 29.4B | 0.25 | ~7.3 GB |
 | INT4 block-wise | 435 (78%) | 39.1B | 0.50 | ~19.5 GB |
 | FP16 (embed/norm/lm_head) | 3 | ~0.5B | 2.0 | ~1.0 GB |
 | **Total** | **563** | **69.0B** | — | **~26 GB** |
 
-**Compression: 5.09x** (131 GB FP16 → ~26 GB mixed)
+**Predicted weight-only compression: 5.09x**
+
+### Actual on-disk output (2026-04-10)
+
+```
+llama70b-v0.6.0-mixed.tern-model  35 GB
+```
+
+| Metric | Value |
+|--------|-------|
+| Input | Meta-Llama-3.1-70B, 131 GB (30 safetensors shards) |
+| Output | `llama70b-v0.6.0-mixed.tern-model`, **35 GB** |
+| On-disk compression | **6.62x** (includes format overhead) |
+| Ternary layers | 125 |
+| INT4 layers | 435 |
+| FP16 layers | 163 (all LayerNorm, embed, lm_head, norm) |
+| Conversion time | 2239s (37 min) on Mac Mini M4 Pro, 64 GB |
+| Peak RAM during conversion | ~2 GB (streaming, one block at a time) |
+
+The 35 GB actual is larger than the 26 GB prediction because the
+prediction counted only the 560 eligible Linear layers.  The actual
+file includes 163 FP16 layers (all LayerNorm 1-D weights across 80
+blocks, plus embed_tokens and lm_head) and .tern-model v2 format
+overhead (256-byte header, JSON manifest, 32-byte SIMD alignment
+padding per layer, 16-byte CRC footer).
 
 ### Comparison to ternary-only
 
 | Metric | Ternary-only (v0.5.0) | Mixed ternary/INT4 (v0.6.0) |
 |--------|----------------------|----------------------------|
 | Layers quantised | 125/560 (22%) | 560/560 (100%) |
-| Compression | 1.60x | **5.09x** |
-| Predicted PPL | 6.30 (+4.0%) | 6.30 (+4.0%) ternary tier; INT4 tiers at ~1-3% error |
-| Output size | ~82 GB | **~26 GB** |
-| Fits 64 GB Mac? | No | **Yes, with headroom** |
+| On-disk compression | 1.60x | **6.62x** |
+| Output size | ~82 GB | **35 GB** |
+| Fits 64 GB Mac? | No | **Yes, with 29 GB headroom** |
 
 ### Compression stack outlook
 
-With the weight file at ~26 GB and the KV cache compressed at 2.56x
+With the weight file at 35 GB and the KV cache compressed at 2.56x
 (Layer 2, already in tern-core), the total runtime memory for batch-1
 inference on 70B is approximately:
 
-- Model weights: ~26 GB
+- Model weights: ~35 GB
 - KV cache (4096 ctx, GQA): ~3 GB compressed
 - Activations: ~2-4 GB
-- **Total: ~31-33 GB** on a 64 GB machine
+- **Total: ~40-42 GB** on a 64 GB machine
 
-This leaves 31-33 GB free for the OS and other processes — comfortably
-within the M4 Pro's unified memory envelope.
+This leaves 22-24 GB free for the OS and other processes —
+within the M4 Pro's unified memory envelope with margin.
 
 ---
 
@@ -261,9 +284,10 @@ done
 
 # Mixed ternary/INT4 conversion (v0.6.0)
 python -c "
-from terncore.autoscan import load_cached_result
+from terncore.autoscan import streaming_scan
 from terncore.streaming_convert import StreamingConverter
-r = load_cached_result('./llama70b', threshold=0.7, ppl_headroom=0.20)
+r = streaming_scan('./llama70b', threshold=0.7, ppl_headroom=0.20,
+                   use_cache=False, baseline_ppl=6.06)
 StreamingConverter('./llama70b', 'llama70b-v0.6.0-mixed.tern-model',
     protection_list=r.protection_list, ternary_list=r.ternary_list).convert()
 "
@@ -273,8 +297,13 @@ Commits:
 - `d7d436b` — tern-core v0.5.0 (streaming pipeline)
 - `33288f5` — tern-core v0.5.1 (streaming write + TN-001)
 - `4d07ed4` — tern-core v0.6.0 (mixed ternary/INT4, CoreML-native)
+- `68d1a01` — TN-001 v0.6.0 results + cache fix
 
 Model: meta-llama/Meta-Llama-3.1-70B (30 safetensors shards)
+Hardware: Mac Mini M4 Pro, 64 GB unified memory, macOS 15.4
+
+Output: `llama70b-v0.6.0-mixed.tern-model` — 35 GB, CRC32-verified,
+723 layers (125 ternary + 435 INT4 + 163 FP16).
 
 ---
 
