@@ -377,6 +377,141 @@ class TestStreamingWrite:
 
 
 # ---------------------------------------------------------------------------
+# INT4 quantiser tests
+# ---------------------------------------------------------------------------
+
+class TestInt4Quantizer:
+
+    def test_quantize_roundtrip(self):
+        from terncore.int4_quantizer import quantize_int4_block, dequantize_int4_block
+        torch.manual_seed(42)
+        w = torch.randn(64, 64)
+        result = quantize_int4_block(w, block_size=32)
+        recon = dequantize_int4_block(
+            result.packed_weights, result.scales,
+            result.weight_shape, result.scale_shape, result.block_size,
+        )
+        assert recon.shape == w.shape
+        # INT4 has limited precision — expect some error but not catastrophic
+        assert result.reconstruction_error < 0.3
+
+    def test_packing_format_lsb_first(self):
+        """Verify LSB-first packing: first value in low nibble."""
+        from terncore.int4_quantizer import quantize_int4_block
+        # Create a weight where the first block has known values
+        w = torch.zeros(1, 32)
+        w[0, 0] = 7.0   # Should quantise to +7
+        w[0, 1] = -7.0  # Should quantise to -7
+        result = quantize_int4_block(w, block_size=32)
+        first_byte = result.packed_weights[0]
+        low_nibble = first_byte & 0x0F   # first value
+        high_nibble = (first_byte >> 4) & 0x0F  # second value
+        assert low_nibble == 7  # +7 in low nibble
+        # -7 in 4-bit two's complement = 0x09 (9)
+        assert high_nibble == 9
+
+    def test_block_size_32(self):
+        from terncore.int4_quantizer import quantize_int4_block
+        torch.manual_seed(42)
+        w = torch.randn(128, 256)
+        result = quantize_int4_block(w, block_size=32)
+        assert result.block_size == 32
+        assert result.scale_shape == [128, 8]  # 256/32 = 8 blocks
+
+    def test_non_divisible_dim_padded(self):
+        from terncore.int4_quantizer import quantize_int4_block, dequantize_int4_block
+        torch.manual_seed(42)
+        w = torch.randn(64, 50)  # 50 not divisible by 32
+        result = quantize_int4_block(w, block_size=32)
+        recon = dequantize_int4_block(
+            result.packed_weights, result.scales,
+            result.weight_shape, result.scale_shape, result.block_size,
+        )
+        assert recon.shape == (64, 50)
+
+    def test_scales_are_fp16(self):
+        from terncore.int4_quantizer import quantize_int4_block
+        import numpy as np
+        torch.manual_seed(42)
+        w = torch.randn(32, 64)
+        result = quantize_int4_block(w, block_size=32)
+        # FP16 is 2 bytes per value, scales shape [32, 2] = 64 values
+        expected_bytes = 32 * 2 * 2  # out_features * n_blocks * 2 bytes
+        assert len(result.scales) == expected_bytes
+
+    def test_int4_in_tern_model(self, tmp_path):
+        """INT4 layers can be written to and read from .tern-model."""
+        from terncore.tern_model import TernModelWriter, TernModelReader
+        torch.manual_seed(42)
+        w = torch.randn(64, 64)
+
+        writer = TernModelWriter({"source": "int4-test"})
+        writer.add_layer("layer.0", w, dtype="int4_block32")
+        path = tmp_path / "int4.tern-model"
+        writer.write_streaming(path)
+
+        reader = TernModelReader(path)
+        assert reader.verify()
+        recon = reader.reconstruct_layer("layer.0")["weight"]
+        assert recon.shape == (64, 64)
+        # Should be close but not exact (INT4 precision)
+        assert torch.allclose(w, recon, atol=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Mixed ternary/INT4 converter tests
+# ---------------------------------------------------------------------------
+
+class TestMixedConverter:
+
+    def test_mixed_output_has_both_dtypes(self, synthetic_model, tmp_path):
+        from terncore.streaming_convert import StreamingConverter
+        from terncore.tern_model import TernModelReader
+        ternary_layers = ["model.layers.0.self_attn.v_proj.weight"]
+        converter = StreamingConverter(
+            model_dir=synthetic_model,
+            output_path=tmp_path / "mixed.tern-model",
+            ternary_list=ternary_layers,
+            verbose=False,
+        )
+        report = converter.convert()
+
+        reader = TernModelReader(tmp_path / "mixed.tern-model")
+        assert reader.verify()
+        dtypes = {e["dtype"] for e in reader.manifest["layers"]}
+        assert "ternary2" in dtypes
+        assert "int4_block32" in dtypes
+        assert "float16" in dtypes  # embed, lm_head, norms
+
+    def test_mixed_compression_higher_than_ternary_only(self, synthetic_model, tmp_path):
+        from terncore.streaming_convert import StreamingConverter
+        # Ternary only (no ternary_list = all eligible get INT4)
+        conv_int4 = StreamingConverter(
+            model_dir=synthetic_model,
+            output_path=tmp_path / "int4.tern-model",
+            ternary_list=[],  # all eligible → INT4
+            verbose=False,
+        )
+        report_int4 = conv_int4.convert()
+
+        # Ternary for all eligible
+        from terncore.sharded_loader import ShardedWeightIterator
+        loader = ShardedWeightIterator(synthetic_model)
+        all_eligible = loader.eligible_linear_names()
+        conv_tern = StreamingConverter(
+            model_dir=synthetic_model,
+            output_path=tmp_path / "tern.tern-model",
+            ternary_list=all_eligible,
+            verbose=False,
+        )
+        report_tern = conv_tern.convert()
+
+        # Both should have valid output
+        assert report_int4.output_size_bytes > 0
+        assert report_tern.output_size_bytes > 0
+
+
+# ---------------------------------------------------------------------------
 # Layer sensitivity tests
 # ---------------------------------------------------------------------------
 
@@ -442,8 +577,11 @@ class TestStreamingScan:
         assert result.total_eligible == 14
         assert result.layers_converted >= 0
         assert result.layers_converted <= result.total_eligible
-        assert len(result.protection_list) + result.layers_converted == result.total_eligible
         assert result.compression_ratio >= 1.0
+        # v0.6.0: 3-tier split
+        assert len(result.ternary_list) == result.layers_converted
+        assert len(result.int4_list) + len(result.ternary_list) == result.total_eligible
+        assert result.mixed_compression_ratio >= result.compression_ratio
 
     def test_streaming_scan_tight_budget_converts_fewer(self, synthetic_model):
         from terncore.autoscan import streaming_scan

@@ -86,21 +86,24 @@ class TernModelWriter:
         sensitivity_score: float = 0.0,
         quant_error: float = 0.0,
         bias: Optional[torch.Tensor] = None,
+        block_size: int = 32,
     ) -> None:
         """
         Add a layer from raw FP32 weights.
 
         For dtype="ternary2": quantises, packs, and stores 2-bit weights.
         For dtype="float16": stores weights in half precision.
+        For dtype="int4_block32": quantises to block-wise INT4 (CoreML-native).
 
         Args:
             name:              Layer name (e.g. "model.layers.0.self_attn.v_proj").
             weights:           FP32 weight tensor.
-            dtype:             "ternary2" or "float16".
+            dtype:             "ternary2", "float16", or "int4_block32".
             threshold:         Quantisation threshold (ternary only).
             sensitivity_score: From per-layer sensitivity analysis.
             quant_error:       Reconstruction MSE vs original.
             bias:              Optional bias tensor.
+            block_size:        Block size for INT4 quantisation (default 32).
         """
         if dtype == "ternary2":
             packed, alpha, bitmap, sparsity = self.pack_ternary(weights, threshold)
@@ -116,6 +119,15 @@ class TernModelWriter:
                 quant_error=quant_error,
                 bias=bias,
             )
+        elif dtype == "int4_block32":
+            self._add_int4_layer(
+                name=name,
+                weights=weights,
+                block_size=block_size,
+                sensitivity_score=sensitivity_score,
+                quant_error=quant_error,
+                bias=bias,
+            )
         elif dtype == "float16":
             self._add_fp16_layer(
                 name=name,
@@ -125,7 +137,10 @@ class TernModelWriter:
                 bias=bias,
             )
         else:
-            raise ValueError(f"Unsupported dtype: {dtype!r}. Use 'ternary2' or 'float16'.")
+            raise ValueError(
+                f"Unsupported dtype: {dtype!r}. "
+                f"Use 'ternary2', 'int4_block32', or 'float16'."
+            )
 
     def add_ternary_layer(
         self,
@@ -178,6 +193,80 @@ class TernModelWriter:
             "_bias": bias_bytes,
         })
 
+    def add_int4_layer(
+        self,
+        name: str,
+        packed_weights: bytes,
+        scales: bytes,
+        shape: list[int],
+        scale_shape: list[int],
+        block_size: int = 32,
+        **metadata: Any,
+    ) -> None:
+        """
+        Add a pre-packed INT4 block-wise quantised layer.
+
+        Args:
+            name:           Layer name.
+            packed_weights: INT4 packed bytes (2 values per byte, LSB-first).
+            scales:         FP16 per-block scale bytes.
+            shape:          Original weight shape [out_features, in_features].
+            scale_shape:    Scale tensor shape [out_features, n_blocks].
+            block_size:     Block size used during quantisation.
+            **metadata:     Additional fields (sensitivity_score, quant_error, bias).
+        """
+        num_params = 1
+        for s in shape:
+            num_params *= s
+
+        bias_tensor = metadata.pop("bias", None)
+        bias_bytes = None
+        has_bias = False
+        if bias_tensor is not None:
+            has_bias = True
+            bias_bytes = bias_tensor.detach().float().numpy().tobytes()
+
+        self._layers.append({
+            "name": name,
+            "dtype": "int4_block32",
+            "shape": shape,
+            "scale_shape": scale_shape,
+            "block_size": block_size,
+            "num_params": num_params,
+            "sensitivity_score": metadata.get("sensitivity_score", 0.0),
+            "quant_error": metadata.get("quant_error", 0.0),
+            "has_bias": has_bias,
+            # Binary data
+            "_packed": packed_weights,
+            "_scales": scales,
+            "_bias": bias_bytes,
+        })
+
+    def _add_int4_layer(
+        self,
+        name: str,
+        weights: torch.Tensor,
+        block_size: int = 32,
+        sensitivity_score: float = 0.0,
+        quant_error: float = 0.0,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Quantise and add an INT4 block-wise layer from FP32 weights."""
+        from terncore.int4_quantizer import quantize_int4_block
+
+        result = quantize_int4_block(weights, block_size=block_size)
+        self.add_int4_layer(
+            name=name,
+            packed_weights=result.packed_weights,
+            scales=result.scales,
+            shape=result.weight_shape,
+            scale_shape=result.scale_shape,
+            block_size=result.block_size,
+            sensitivity_score=sensitivity_score,
+            quant_error=result.reconstruction_error,
+            bias=bias,
+        )
+
     def _add_fp16_layer(
         self,
         name: str,
@@ -227,6 +316,8 @@ class TernModelWriter:
 
             if layer["dtype"] == "ternary2":
                 self._write_ternary_layer(weight_buf, layer)
+            elif layer["dtype"] == "int4_block32":
+                self._write_int4_layer(weight_buf, layer)
             else:
                 self._write_fp16_layer(weight_buf, layer)
 
@@ -339,6 +430,27 @@ class TernModelWriter:
         else:
             buf.write(struct.pack("<I", 0))
 
+    def _write_int4_layer(self, buf: io.BytesIO, layer: dict) -> None:
+        """Write an INT4 block-wise layer's binary data to the buffer."""
+        packed = layer["_packed"]
+        scales = layer["_scales"]
+        bias = layer.get("_bias")
+
+        # block_size (uint32)
+        buf.write(struct.pack("<I", layer["block_size"]))
+        # packed weights
+        buf.write(struct.pack("<I", len(packed)))
+        buf.write(packed)
+        # scales
+        buf.write(struct.pack("<I", len(scales)))
+        buf.write(scales)
+        # bias
+        if bias is not None:
+            buf.write(struct.pack("<I", len(bias)))
+            buf.write(bias)
+        else:
+            buf.write(struct.pack("<I", 0))
+
     def _write_fp16_layer(self, buf: io.BytesIO, layer: dict) -> None:
         """Write an FP16 protected layer's binary data to the buffer."""
         weight_data = layer["_weight_data"]
@@ -391,6 +503,9 @@ class TernModelWriter:
                     if layer["dtype"] == "ternary2":
                         self._write_ternary_layer(layer_buf, layer)
                         num_ternary += 1
+                    elif layer["dtype"] == "int4_block32":
+                        self._write_int4_layer(layer_buf, layer)
+                        num_ternary += 1  # count in ternary bucket for header
                     else:
                         self._write_fp16_layer(layer_buf, layer)
                         num_protected += 1
@@ -725,6 +840,8 @@ class TernModelReader:
 
         if entry["dtype"] == "ternary2":
             return self._reconstruct_ternary(buf, entry)
+        elif entry["dtype"] == "int4_block32":
+            return self._reconstruct_int4(buf, entry)
         elif entry["dtype"] == "float16":
             return self._reconstruct_fp16(buf, entry)
         else:
@@ -761,6 +878,44 @@ class TernModelReader:
             buf.read(bitmap_size)
 
         # Read bias if present
+        bias_size = struct.unpack("<I", buf.read(4))[0]
+        if bias_size > 0:
+            bias_bytes = buf.read(bias_size)
+            result["bias"] = torch.frombuffer(
+                bytearray(bias_bytes), dtype=torch.float32
+            ).clone()
+
+        return result
+
+    def _reconstruct_int4(
+        self, buf: io.BytesIO, entry: dict
+    ) -> dict[str, torch.Tensor]:
+        """Reconstruct an INT4 block-wise layer from its binary data."""
+        from terncore.int4_quantizer import dequantize_int4_block
+
+        shape = entry["shape"]
+        scale_shape = entry["scale_shape"]
+        block_size = entry.get("block_size", 32)
+
+        # Read block_size
+        stored_bs = struct.unpack("<I", buf.read(4))[0]
+
+        # Read packed weights
+        packed_size = struct.unpack("<I", buf.read(4))[0]
+        packed_bytes = buf.read(packed_size)
+
+        # Read scales
+        scales_size = struct.unpack("<I", buf.read(4))[0]
+        scales_bytes = buf.read(scales_size)
+
+        # Dequantise
+        weight = dequantize_int4_block(
+            packed_bytes, scales_bytes, shape, scale_shape, stored_bs
+        )
+
+        result: dict[str, torch.Tensor] = {"weight": weight}
+
+        # Read bias
         bias_size = struct.unpack("<I", buf.read(4))[0]
         if bias_size > 0:
             bias_bytes = buf.read(bias_size)

@@ -90,14 +90,17 @@ class StreamingConverter:
         model_dir: str | Path,
         output_path: str | Path,
         protection_list: Optional[list[str]] = None,
+        ternary_list: Optional[list[str]] = None,
         threshold: float = 0.7,
         verbose: bool = True,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.output_path = Path(output_path)
         self.protection_list = protection_list or []
+        self.ternary_list = ternary_list or []
         self.threshold = threshold
         self.verbose = verbose
+        self._ternary_set: set[str] = set(self.ternary_list)
 
     def convert(self) -> StreamingConversionReport:
         """Run the streaming conversion pipeline.
@@ -193,15 +196,21 @@ class StreamingConverter:
         writer: TernModelWriter,
         report: StreamingConversionReport,
     ) -> None:
-        """Quantise or protect a single weight tensor."""
+        """Quantise or protect a single weight tensor.
+
+        Three-tier assignment:
+        - ternary_list → ternary {-1, 0, +1}
+        - int4_list → INT4 block-wise (CoreML-native)
+        - everything else → FP16
+        """
         num_params = tensor.numel()
         report.total_weights += 1
         report.total_params += num_params
 
         is_1d = tensor.ndim < 2  # LayerNorm weights, biases
-        protected = is_1d or _is_protected(name, protection_set)
+        always_protected = is_1d or _is_protected(name, protection_set)
 
-        if protected:
+        if always_protected:
             writer.add_layer(name, tensor.float(), dtype="float16")
             report.protected_weights += 1
             report.protected_params += num_params
@@ -209,7 +218,7 @@ class StreamingConverter:
                 "name": name, "dtype": "float16",
                 "shape": list(tensor.shape), "params": num_params,
             })
-        else:
+        elif name in self._ternary_set:
             packed, alpha, bitmap, sparsity = TernModelWriter.pack_ternary(
                 tensor.float(), self.threshold
             )
@@ -228,6 +237,26 @@ class StreamingConverter:
                 "name": name, "dtype": "ternary2",
                 "shape": list(tensor.shape), "params": num_params,
                 "sparsity": round(sparsity, 4), "alpha": round(alpha, 6),
+            })
+        else:
+            # INT4 block-wise quantisation
+            from terncore.int4_quantizer import quantize_int4_block
+            result = quantize_int4_block(tensor.float(), block_size=32)
+            writer.add_int4_layer(
+                name=name,
+                packed_weights=result.packed_weights,
+                scales=result.scales,
+                shape=result.weight_shape,
+                scale_shape=result.scale_shape,
+                block_size=result.block_size,
+                quant_error=result.reconstruction_error,
+            )
+            report.ternary_weights += 1  # counts as "quantised"
+            report.ternary_params += num_params
+            report.per_layer.append({
+                "name": name, "dtype": "int4_block32",
+                "shape": list(tensor.shape), "params": num_params,
+                "quant_error": round(result.reconstruction_error, 6),
             })
 
     def _log(self, msg: str) -> None:

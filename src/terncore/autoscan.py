@@ -85,6 +85,9 @@ class ScanResult:
     converted_list: list[str]
     sweep_trace: list[dict] = field(default_factory=list)
     cached: bool = False
+    ternary_list: list[str] = field(default_factory=list)
+    int4_list: list[str] = field(default_factory=list)
+    mixed_compression_ratio: float = 0.0
 
     @property
     def ppl_delta_pct(self) -> float:
@@ -585,26 +588,37 @@ def streaming_scan(
         else:
             break
 
-    protection_list = [n for n in eligible_names if n not in set(converted_names)]
+    # --- 3-tier split: ternary / INT4 / FP16 ---
+    converted_set = set(converted_names)
+    ternary_names = list(converted_names)  # tolerant layers → ternary
+    int4_names = [n for n in eligible_names if n not in converted_set]  # sensitive → INT4
+    protection_list: list[str] = []  # no FP16 among eligible (all get INT4 or ternary)
+
     layers_converted = len(converted_names)
     pct_converted = layers_converted / total_eligible * 100 if total_eligible else 0
 
-    # Predicted compression ratio
-    ternary_params = sum(s.num_params for s in sensitivities
-                         if s.name in set(converted_names))
+    # Compression ratios
+    ternary_params = sum(s.num_params for s in sensitivities if s.name in converted_set)
+    int4_params = sum(s.num_params for s in sensitivities if s.name not in converted_set)
     total_params = sum(s.num_params for s in sensitivities)
-    # Add protected-by-pattern params (rough estimate from non-eligible)
+
+    # Ternary-only compression (legacy)
+    original_bytes = total_params * 2  # FP16 baseline
     ternary_bytes = ternary_params * 0.25
     fp16_bytes = (total_params - ternary_params) * 2
-    original_bytes = total_params * 2
     compression_ratio = original_bytes / (ternary_bytes + fp16_bytes) if (ternary_bytes + fp16_bytes) > 0 else 1.0
+
+    # Mixed ternary/INT4 compression
+    int4_bytes = int4_params * 0.5  # 4 bits per weight
+    mixed_compressed = ternary_bytes + int4_bytes
+    mixed_compression_ratio = original_bytes / mixed_compressed if mixed_compressed > 0 else 1.0
 
     elapsed = time.perf_counter() - t0
 
     # Print sensitivity ranking
     print(f"\n  Sensitivity ranking (top-10 most tolerant):")
     for i, s in enumerate(sensitivities[:10]):
-        tag = "CONVERT" if s.name in set(converted_names) else "PROTECT"
+        tag = "TERNARY" if s.name in converted_set else "INT4"
         print(f"    {i+1:3d}. {s.name}")
         print(f"         error={s.relative_error:.6f}  sparsity={s.sparsity:.4f}  [{tag}]")
 
@@ -612,12 +626,15 @@ def streaming_scan(
         print(f"    ... ({total_eligible - 10} more)")
         print(f"\n  Least tolerant (bottom-3):")
         for s in sensitivities[-3:]:
-            tag = "CONVERT" if s.name in set(converted_names) else "PROTECT"
+            tag = "TERNARY" if s.name in converted_set else "INT4"
             print(f"    {s.name}")
             print(f"         error={s.relative_error:.6f}  sparsity={s.sparsity:.4f}  [{tag}]")
 
-    print(f"\n  Scan complete in {elapsed:.1f}s: "
-          f"{layers_converted}/{total_eligible} layers safe for ternary")
+    print(f"\n  Scan complete in {elapsed:.1f}s")
+    print(f"    Ternary: {len(ternary_names)}/560 layers ({ternary_params:,} params)")
+    print(f"    INT4:    {len(int4_names)}/560 layers ({int4_params:,} params)")
+    print(f"    Ternary-only compression: {compression_ratio:.2f}x")
+    print(f"    Mixed ternary/INT4:       {mixed_compression_ratio:.2f}x")
 
     # Predicted PPL: linear interpolation from error fraction
     if total_error > 0:
@@ -640,6 +657,9 @@ def streaming_scan(
         converted_list=converted_names,
         sweep_trace=sweep_trace,
         cached=False,
+        ternary_list=ternary_names,
+        int4_list=int4_names,
+        mixed_compression_ratio=round(mixed_compression_ratio, 2),
     )
 
     _save_result(result, threshold)
