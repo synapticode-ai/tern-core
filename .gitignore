@@ -29,3 +29,6 @@ src/terncore/csrc/test_matmul
 src/terncore/csrc/test_packed
 src/terncore/csrc/test_simd
 src/terncore/csrc/test_sparse_skip
+
+# Build-time generated headers
+src/terncore/csrc/terncore_version.h

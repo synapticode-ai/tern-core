@@ -16,6 +16,7 @@
 #include "ternary_matmul.h"
 #include "ternary_packed.h"
 #include "sparse_skip.h"
+#include "terncore_version.h"  /* TERNCORE_VERSION_STRING (build-time, from pyproject.toml) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -454,7 +455,8 @@ static void test_version(void)
 {
     const char *ver = terncore_version();
     ASSERT(ver != NULL, "version not NULL");
-    ASSERT(strcmp(ver, "0.1.0") == 0, "version is 0.1.0");
+    ASSERT(strcmp(ver, TERNCORE_VERSION_STRING) == 0,
+           "terncore_version() returns build-time TERNCORE_VERSION_STRING");
 }
 
 /* ── Main ────────────────────────────────────────────────────────── */

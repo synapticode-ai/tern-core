@@ -34,6 +34,7 @@
 
 #include "sparse_skip.h"      /* includes ternary_packed.h → ternary_matmul.h */
 #include "ternary_simd.h"     /* TERN_SIMD_*, AVX2/NEON kernel declarations   */
+#include "terncore_version.h" /* TERNCORE_VERSION_STRING (build-time, from pyproject.toml) */
 
 /* ── Cached SIMD capabilities ────────────────────────────────────── */
 
@@ -192,10 +193,11 @@ uint32_t get_simd_support(void)
 /* ══════════════════════════════════════════════════════════════════════
  * terncore_version — Library version string
  *
- * Returns a pointer to a static string.  Matches the version in
- * pyproject.toml.
+ * Returns a pointer to a static string.  TERNCORE_VERSION_STRING is
+ * generated at build time from pyproject.toml's [project] version
+ * field — see terncore_version.h and the Makefile rule.
  * ═════════════════════════════════════════════════════════════════════*/
 const char *terncore_version(void)
 {
-    return "0.1.0";
+    return TERNCORE_VERSION_STRING;
 }
