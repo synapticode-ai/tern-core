@@ -20,7 +20,7 @@ import math
 import numpy as np
 import pytest
 
-from terncore.coreml_export import (
+from terncore.coreml_export_helpers import (
     FP16_MAX,
     _cast_fp16_retain_with_guards,
     _validate_ternary2_alpha,
