@@ -92,18 +92,27 @@ Dryrun-only, full Phase 2 pending:
 | **CPU_AND_NE** | **215.07** | **297.6** | **9.7** | **31.0 GB** |
 | CPU_AND_GPU | 226.55 | 282.5 | 245.2 | 31.0 GB |
 
-CPU_AND_NE is the confirmed winner. The 9.7 ms stdev is the headline
-stability number.
+CPU_AND_NE retains the latency-stability lead under cold-start
+jitter (9.7 ms stdev against 245 ms outliers on CPU_AND_GPU). On
+steady-state energy, CPU_ONLY and CPU_AND_NE land within a 1.3 %
+near-tie at ~5.4 W; see `benchmarks/mistral_7b_phase_d_full.md`
+for the three-row breakdown.
 
-### Mistral-7B — Phase D (Energy Profile, CPU_AND_NE)
+### Mistral-7B — Phase D (Energy Baselines, three compute units)
 
-| Metric | Value |
-|---|---|
-| Mean package power | 5.39 W |
-| Energy per inference | 1,122.6 mJ |
-| Energy per token (512 tokens) | 2.19 mJ |
-| Inferences in 15 s | 72 |
-| Power stdev | 0.70 W |
+Captured 2026-04-15. Same 15 s sustained-inference methodology
+across all three rows. SEQ_LEN = 64 per the powermetrics log header.
+
+| Compute Unit | tok/s | Mean ms | Latency stdev | Mean W | Stdev W | mJ/inference | mJ/token |
+|---|---|---|---|---|---|---|---|
+| CPU_ONLY    | 304.5 | 210.16 | 4.58 ms | 5.458  | 0.955 | 1137.1 | 17.77 |
+| CPU_AND_NE  | 297.6 | 215.07 | 9.68 ms | 5.388  | 0.703 | 1122.6 | 17.54 |
+| CPU_AND_GPU | 387.8 | 165.02 | 0.89 ms | 20.142 | 3.755 | 3320.1 | 51.88 |
+
+CPU_ONLY and CPU_AND_NE land within a 1.3 % energy envelope at
+~5.4 W. CPU_AND_GPU pays a 2.96× energy premium for a 27 % latency
+gain. Full provenance and both framings:
+`benchmarks/mistral_7b_phase_d_full.md`.
 
 ### Mistral-7B — Phase C (Palettisation, non-fatal)
 
@@ -117,11 +126,22 @@ Root cause: tern-compiler export bug. Inf values land in FP16-encoded
 ternary weights. The fix belongs in the tern-core compiler path
 rather than the benchmark runner.
 
-### Pending — Energy Baseline
+### Complete — Energy Baseline
 
-Phase D energy profile covers CPU_AND_NE only. CPU_ONLY and
-CPU_AND_GPU baselines are still pending. Both anchor the 5.39 W
-headline in the Apple brief — run them before the May conversation.
+CPU_ONLY and CPU_AND_GPU baselines ran 2026-04-15 alongside the
+CPU_AND_NE Phase D capture. Three citations:
+
+- `benchmarks/mistral_7b_phase_d_full.md` — canonical narrative,
+  both framings, full provenance.
+- `benchmarks/mistral7b_phase2.json` — structured data for all
+  three compute units (`energy.cpu_only_baseline`,
+  `energy.raw_best`, `energy.cpu_and_gpu_baseline`).
+- `benchmarks/mistral7b_energy_baselines.log` — raw powermetrics
+  output for CPU_ONLY and CPU_AND_GPU.
+
+A confirmation pass (fork iii Phase 2) is queued to re-run the
+three baselines from a clean thermal state via the
+archive-restored mlpackage.
 
 ---
 
@@ -278,7 +298,8 @@ python -m terncore.coreml_export \
 ```
 
 Available presets: `llama32-1b`, `llama32-3b`, `mistral-7b`,
-`gemma3-4b`, `gemma3-12b`.
+`gemma3-4b`, `gemma3-12b`, `phi4-14b`, `qwen25-7b`, `dsr1-7b`,
+`dsr1-14b`.
 
 **Venv note:** `source .venv/bin/activate` activates
 `/Users/syn/synapticode/venv/bin/python`, which carries terncore on
