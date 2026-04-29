@@ -64,11 +64,41 @@ endif
 ALL_SRCS = $(COMMON_SRCS) $(SIMD_SRCS)
 OBJS     = $(ALL_SRCS:.c=.o)
 
+# ── Version header generation from pyproject.toml ───────────────────
+#
+# Single source of truth: bumps in pyproject.toml flow to the C
+# kernel automatically at build time. Uses tomllib (Python 3.11+) or
+# falls back to tomli (Python 3.10) per pyproject.toml's
+# requires-python = ">=3.10".
+
+PYPROJECT      = ../../../pyproject.toml
+VERSION_HEADER = terncore_version.h
+
+.DEFAULT_GOAL := all
+
+define VERSION_HEADER_SCRIPT
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open('$(PYPROJECT)', 'rb') as f:
+    v = tomllib.load(f)['project']['version']
+print('#ifndef TERNCORE_VERSION_H')
+print('#define TERNCORE_VERSION_H')
+print(f'#define TERNCORE_VERSION_STRING "{v}"')
+print('#endif')
+endef
+export VERSION_HEADER_SCRIPT
+
+$(VERSION_HEADER): $(PYPROJECT)
+	@echo "Generating $@ from $<"
+	@python3 -c "$$VERSION_HEADER_SCRIPT" > $@
+
 # ── Targets ─────────────────────────────────────────────────────────
 
 .PHONY: all clean test
 
-all: $(LIB)
+all: $(VERSION_HEADER) $(LIB)
 
 $(LIB): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -114,4 +144,4 @@ test: test_matmul test_packed test_sparse_skip test_simd
 # ── Cleanup ─────────────────────────────────────────────────────────
 
 clean:
-	rm -f $(OBJS) $(LIB) test_matmul test_packed test_sparse_skip test_simd
+	rm -f $(OBJS) $(LIB) $(VERSION_HEADER) test_matmul test_packed test_sparse_skip test_simd
