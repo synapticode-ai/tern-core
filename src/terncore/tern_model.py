@@ -452,11 +452,15 @@ class TernModelWriter:
             buf.write(struct.pack("<I", 0))
 
     def _write_fp16_layer(self, buf: io.BytesIO, layer: dict) -> None:
-        """Write an FP16 protected layer's binary data to the buffer."""
+        """Write an FP16 protected layer's binary data to the buffer.
+
+        Uses 8-byte (<Q) size prefix for weight data to support tensors
+        larger than 4 GB (e.g. per-layer embeddings in multimodal models).
+        """
         weight_data = layer["_weight_data"]
         bias = layer.get("_bias")
 
-        buf.write(struct.pack("<I", len(weight_data)))
+        buf.write(struct.pack("<Q", len(weight_data)))
         buf.write(weight_data)
 
         if bias is not None:
@@ -931,8 +935,8 @@ class TernModelReader:
         """Reconstruct an FP16 layer from its binary data."""
         shape = entry["shape"]
 
-        # Read weight data
-        weight_size = struct.unpack("<I", buf.read(4))[0]
+        # Read weight data — 8-byte size prefix (supports >4 GB tensors)
+        weight_size = struct.unpack("<Q", buf.read(8))[0]
         weight_bytes = buf.read(weight_size)
         weight = torch.frombuffer(
             bytearray(weight_bytes), dtype=torch.float16
