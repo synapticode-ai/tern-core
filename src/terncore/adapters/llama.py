@@ -57,7 +57,7 @@ class LlamaAdapter(ArchitectureAdapter):
     def info(self) -> AdapterInfo:
         return AdapterInfo(
             name="llama",
-            architecture="LlamaForCausalLM",
+            architectures=["LlamaForCausalLM"],
             model_type="llama",
             description=(
                 "Standard Llama adapter — covers Llama 1/2/3.x, "

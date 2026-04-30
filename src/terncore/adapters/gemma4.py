@@ -111,7 +111,7 @@ class Gemma4Adapter(ArchitectureAdapter):
     def info(self) -> AdapterInfo:
         return AdapterInfo(
             name="gemma4",
-            architecture="Gemma4ForConditionalGeneration",
+            architectures=["Gemma4ForConditionalGeneration"],
             model_type="gemma4",
             description=(
                 "Google Gemma 4 adapter — supports text-only and E4B "

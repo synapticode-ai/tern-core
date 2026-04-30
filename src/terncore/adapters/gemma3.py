@@ -78,7 +78,7 @@ class Gemma3Adapter(ArchitectureAdapter):
     def info(self) -> AdapterInfo:
         return AdapterInfo(
             name="gemma3",
-            architecture="Gemma3ForConditionalGeneration",
+            architectures=["Gemma3ForConditionalGeneration"],
             model_type="gemma3",
             description=(
                 "Google Gemma 3 adapter — supports text + vision. "

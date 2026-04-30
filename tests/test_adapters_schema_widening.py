@@ -51,7 +51,7 @@ class _StubAdapter(ArchitectureAdapter):
     def info(self) -> AdapterInfo:
         return AdapterInfo(
             name="stub",
-            architecture="StubForCausalLM",
+            architectures=["StubForCausalLM"],
             model_type="stub",
             description="test stub",
             block_pattern=_BLOCK_PATTERN,
@@ -68,7 +68,7 @@ class _StubAdapter(ArchitectureAdapter):
 def test_adapter_info_has_expert_pattern_field_with_none_default():
     info = AdapterInfo(
         name="x",
-        architecture="X",
+        architectures=["X"],
         model_type="x",
         description="",
         block_pattern=_BLOCK_PATTERN,
@@ -81,7 +81,7 @@ def test_adapter_info_has_expert_pattern_field_with_none_default():
 def test_adapter_info_has_attention_type_pattern_field_with_none_default():
     info = AdapterInfo(
         name="x",
-        architecture="X",
+        architectures=["X"],
         model_type="x",
         description="",
         block_pattern=_BLOCK_PATTERN,

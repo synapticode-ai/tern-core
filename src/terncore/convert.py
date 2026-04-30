@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import sys
 import time
@@ -468,6 +469,44 @@ def _printer(verbose: bool):
     return _log
 
 
+def _read_hf_arch_from_config(model_dir: Path) -> str:
+    """Read the HF architecture from ``config.json`` in ``model_dir``.
+
+    Used to feed :meth:`ArchitectureAdapter.validate_architecture`
+    at the entry of the conversion pipeline. Stdlib-only — no
+    transformers dependency.
+
+    Raises :class:`ArchitectureMismatch` if ``config.json`` is
+    missing, unreadable, or has no usable ``architectures`` field.
+    The error message names the path so the operator can
+    investigate.
+    """
+    from terncore.adapters.base import ArchitectureMismatch
+
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        raise ArchitectureMismatch(
+            f"config.json not found at {config_path}. Cannot "
+            f"validate adapter routing. Verify the model directory "
+            f"contains a valid HF config."
+        )
+    try:
+        with open(config_path) as f:
+            hf_config = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise ArchitectureMismatch(
+            f"Failed to read config.json at {config_path}: {e}. "
+            f"Cannot validate adapter routing."
+        )
+    architectures = hf_config.get("architectures") or []
+    if not architectures:
+        raise ArchitectureMismatch(
+            f"config.json at {config_path} has no 'architectures' "
+            f"field or it is empty. Cannot validate adapter routing."
+        )
+    return architectures[0]
+
+
 # ── Full adapter-aware conversion (mixed ternary/INT4/FP16) ────────
 
 
@@ -516,7 +555,7 @@ def full_convert(
     _log(f"  Full Conversion — {info.name} adapter")
     _log("=" * 68)
     _log(f"  Model:     {model_id}")
-    _log(f"  Adapter:   {info.name} ({info.architecture})")
+    _log(f"  Adapter:   {info.name} ({', '.join(info.architectures)})")
     _log(f"  Threshold: {threshold}")
     _log(f"  Output:    {output_dir}")
 
@@ -543,6 +582,11 @@ def full_convert(
             _log(f"  Resolved: {resolved_dir}")
         except Exception as e:
             raise RuntimeError(f"Cannot resolve model: {e}")
+
+    # ── Validate adapter routing against HF config ──
+    hf_arch = _read_hf_arch_from_config(resolved_dir)
+    adapter.validate_architecture(hf_arch)
+    _log(f"  Validated: HF arch '{hf_arch}' matches adapter '{info.name}'")
 
     # ── Discover safetensors files ──
     index_path = resolved_dir / "model.safetensors.index.json"
@@ -805,7 +849,7 @@ def dry_run_convert(
     _log(f"  Dry-Run Conversion — {info.name} adapter")
     _log("=" * 68)
     _log(f"  Model:     {model_id}")
-    _log(f"  Adapter:   {info.name} ({info.architecture})")
+    _log(f"  Adapter:   {info.name} ({', '.join(info.architectures)})")
     _log(f"  Threshold: {threshold}")
     _log(f"  Output:    {output_dir}")
 
@@ -837,6 +881,11 @@ def dry_run_convert(
             _resolved_dir = None
 
     if _resolved_dir is not None:
+        # ── Validate adapter routing against HF config ──
+        hf_arch = _read_hf_arch_from_config(_resolved_dir)
+        adapter.validate_architecture(hf_arch)
+        _log(f"  Validated: HF arch '{hf_arch}' matches adapter '{info.name}'")
+
         from safetensors import safe_open
 
         index_path = _resolved_dir / "model.safetensors.index.json"
@@ -1044,7 +1093,7 @@ def dry_run_convert(
         "runner": "terncore.convert --dry-run",
         "model_id": model_id,
         "adapter": info.name,
-        "architecture": info.architecture,
+        "architectures": list(info.architectures),
         "threshold": threshold,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),

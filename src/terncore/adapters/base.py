@@ -14,6 +14,18 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 
+class ArchitectureMismatch(Exception):
+    """Raised when a model's HF config architecture does not match
+    any architecture declared by the adapter, or when the
+    architecture cannot be read from the model's ``config.json``.
+
+    The error message names both sides (adapter and offending
+    architecture) so the operator can either route to a different
+    adapter or update the adapter's allow-list if the model is
+    genuinely architecture-shape-compatible.
+    """
+
+
 @dataclass(frozen=True)
 class WeightClassification:
     """Classification of a single weight tensor for conversion."""
@@ -36,7 +48,7 @@ class AdapterInfo:
     """Metadata about an architecture adapter."""
 
     name: str
-    architecture: str  # HF architecture class name
+    architectures: list[str]  # HF architecture class names supported by this adapter
     model_type: str  # HF model_type field
     description: str
     block_pattern: re.Pattern
@@ -218,3 +230,28 @@ class ArchitectureAdapter:
         if pattern.search(name):
             return "linear"
         return "full"
+
+    def validate_architecture(self, hf_arch: str) -> None:
+        """Verify the HF config architecture is supported.
+
+        Raises :class:`ArchitectureMismatch` if ``hf_arch`` is not
+        in ``self.info().architectures``. Subclasses MAY override
+        to add stricter checks (e.g., a future MoE adapter that
+        also wants to verify ``num_local_experts > 0``).
+
+        Concrete default — checks the declared allow-list.
+        Heuristic family-matching is deliberately not supported;
+        if a model is shape-compatible, the architecture must be
+        declared explicitly in the adapter's
+        :attr:`AdapterInfo.architectures` list.
+        """
+        info = self.info()
+        if hf_arch not in info.architectures:
+            raise ArchitectureMismatch(
+                f"Adapter '{info.name}' does not support "
+                f"architecture '{hf_arch}'. Declared architectures: "
+                f"{info.architectures}. Either route to a different "
+                f"adapter or, if the model is genuinely shape-"
+                f"compatible, add '{hf_arch}' to the adapter's "
+                f"AdapterInfo.architectures list."
+            )
