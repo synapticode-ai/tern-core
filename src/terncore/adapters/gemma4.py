@@ -58,23 +58,6 @@ _PROJ_PRIORITY = [
     "down_proj",     # expert down projection (same name, inside .experts.)
 ]
 
-# Patterns that identify non-language components in multimodal models.
-_VISION_PATTERNS = (
-    "vision_tower",
-    "vision_model",
-    "embed_vision",
-)
-
-_AUDIO_PATTERNS = (
-    "audio_tower",
-    "embed_audio",
-)
-
-_PROJECTOR_PATTERNS = (
-    "multi_modal_projector",
-    "multimodal_projector",
-)
-
 # Patterns for weights that must always stay in FP16.
 _ALWAYS_PROTECTED = (
     "embed_tokens",
@@ -96,18 +79,6 @@ _ALWAYS_PROTECTED = (
 )
 
 
-def _detect_component(name: str) -> str:
-    """Classify which model component a weight belongs to."""
-    name_lower = name.lower()
-    if any(p in name_lower for p in _VISION_PATTERNS):
-        return "vision"
-    if any(p in name_lower for p in _AUDIO_PATTERNS):
-        return "audio"
-    if any(p in name_lower for p in _PROJECTOR_PATTERNS):
-        return "projector"
-    return "language"
-
-
 @register("gemma4")
 class Gemma4Adapter(ArchitectureAdapter):
     """Architecture adapter for Gemma 4 (text-only and E4B multimodal).
@@ -122,6 +93,20 @@ class Gemma4Adapter(ArchitectureAdapter):
     4. 1-D weights (biases, scalar params) → FP16-retain.
     5. All remaining 2-D weights in transformer blocks → ternary-eligible.
     """
+
+    _VISION_PATTERNS: list[str] = [
+        "vision_tower",
+        "vision_model",
+        "embed_vision",
+    ]
+    _AUDIO_PATTERNS: list[str] = [
+        "audio_tower",
+        "embed_audio",
+    ]
+    _PROJECTOR_PATTERNS: list[str] = [
+        "multi_modal_projector",
+        "multimodal_projector",
+    ]
 
     def info(self) -> AdapterInfo:
         return AdapterInfo(
@@ -164,7 +149,7 @@ class Gemma4Adapter(ArchitectureAdapter):
     ) -> WeightClassification:
         """Classify a weight tensor for conversion."""
         canonical = self.normalize_name(name)
-        component = _detect_component(name)
+        component = self._detect_component(name)
 
         # Rule 1–2: Non-language components → FP16-retain
         if component == "vision":

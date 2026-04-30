@@ -47,7 +47,16 @@ class ArchitectureAdapter:
     - info() -> AdapterInfo
     - classify_weight(name, shape) -> WeightClassification
     - normalize_name(name) -> str
+
+    Subclasses may override the ``_VISION_PATTERNS`` /
+    ``_AUDIO_PATTERNS`` / ``_PROJECTOR_PATTERNS`` class attributes
+    to drive the default :meth:`_detect_component` behaviour.
+    Empty defaults make text-only adapters trivial.
     """
+
+    _VISION_PATTERNS: list[str] = []
+    _AUDIO_PATTERNS: list[str] = []
+    _PROJECTOR_PATTERNS: list[str] = []
 
     def info(self) -> AdapterInfo:
         """Return adapter metadata."""
@@ -90,3 +99,28 @@ class ArchitectureAdapter:
     def projection_priority(self) -> list[str]:
         """Return projection types ordered by ternary tolerance."""
         return self.info().projection_priority
+
+    def _detect_component(self, name: str) -> str:
+        """Return component bucket for a weight name.
+
+        Default 4-bucket vocab: ``"vision"`` | ``"audio"`` |
+        ``"projector"`` | ``"language"``. Subclasses override the
+        ``_VISION_PATTERNS`` / ``_AUDIO_PATTERNS`` /
+        ``_PROJECTOR_PATTERNS`` class attributes; the method body
+        stays shared.
+
+        Pattern scan priority: vision → audio → projector. If a
+        name matches patterns in multiple buckets, the first
+        match wins. Returns ``"language"`` if no pattern matches
+        (text-only fallback).
+        """
+        for pattern in self._VISION_PATTERNS:
+            if re.search(pattern, name):
+                return "vision"
+        for pattern in self._AUDIO_PATTERNS:
+            if re.search(pattern, name):
+                return "audio"
+        for pattern in self._PROJECTOR_PATTERNS:
+            if re.search(pattern, name):
+                return "projector"
+        return "language"

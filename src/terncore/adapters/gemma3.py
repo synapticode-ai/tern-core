@@ -42,13 +42,6 @@ _PROJ_PRIORITY = [
     "down_proj",
 ]
 
-_VISION_PATTERNS = (
-    "vision_tower",
-    "vision_model",
-    "multi_modal_projector",
-    "multimodal_projector",
-)
-
 _ALWAYS_PROTECTED = (
     "embed_tokens",
     "lm_head",
@@ -58,13 +51,6 @@ _ALWAYS_PROTECTED = (
     "rmsnorm",
     "classifier",
 )
-
-
-def _detect_component(name: str) -> str:
-    name_lower = name.lower()
-    if any(p in name_lower for p in _VISION_PATTERNS):
-        return "vision"
-    return "language"
 
 
 @register("gemma3")
@@ -78,6 +64,16 @@ class Gemma3Adapter(ArchitectureAdapter):
     4. 1-D weights (biases, scalars) → FP16-retain.
     5. All 2-D weights in transformer blocks → ternary-eligible.
     """
+
+    _VISION_PATTERNS: list[str] = [
+        "vision_tower",
+        "vision_model",
+    ]
+    _AUDIO_PATTERNS: list[str] = []
+    _PROJECTOR_PATTERNS: list[str] = [
+        "multi_modal_projector",
+        "multimodal_projector",
+    ]
 
     def info(self) -> AdapterInfo:
         return AdapterInfo(
@@ -93,7 +89,7 @@ class Gemma3Adapter(ArchitectureAdapter):
             projection_priority=list(_PROJ_PRIORITY),
             protection_patterns=list(_ALWAYS_PROTECTED),
             multimodal=True,
-            multimodal_components=["vision"],
+            multimodal_components=["vision", "projector"],
         )
 
     def normalize_name(self, name: str) -> str:
@@ -107,7 +103,7 @@ class Gemma3Adapter(ArchitectureAdapter):
         shape: Optional[list[int]] = None,
     ) -> WeightClassification:
         canonical = self.normalize_name(name)
-        component = _detect_component(name)
+        component = self._detect_component(name)
 
         if component == "vision":
             return WeightClassification(
@@ -115,6 +111,15 @@ class Gemma3Adapter(ArchitectureAdapter):
                 canonical_name=canonical,
                 category="fp16_retain",
                 reason="Vision encoder — modality encoders are FP16-retain",
+                component=component,
+            )
+
+        if component == "projector":
+            return WeightClassification(
+                name=name,
+                canonical_name=canonical,
+                category="fp16_retain",
+                reason="Multi-modal projector — cross-modal alignment is precision-sensitive",
                 component=component,
             )
 
