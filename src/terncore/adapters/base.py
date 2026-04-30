@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,12 @@ class WeightClassification:
     category: str  # "ternary_eligible", "fp16_retain", "skip"
     reason: str  # why this classification was chosen
     component: str  # "language", "vision", "audio", "projector"
+    expert_idx: Optional[int] = None
+    """Integer expert index for MoE expert weights (e.g., 0–7 for
+    Mixtral's 8 experts). ``None`` = not an expert weight."""
+    attention_type: Optional[Literal["full", "linear"]] = None
+    """Attention layer type for hybrid architectures. ``None`` =
+    adapter does not distinguish (default for non-hybrid models)."""
 
 
 @dataclass
@@ -38,6 +44,19 @@ class AdapterInfo:
     protection_patterns: list[str]
     multimodal: bool = False
     multimodal_components: list[str] = field(default_factory=list)
+    expert_pattern: Optional[re.Pattern] = None
+    """Regex with named group ``"expert_idx"`` capturing the expert
+    integer for MoE models. ``None`` = non-MoE adapter. When set,
+    the base :meth:`ArchitectureAdapter._extract_expert_idx`
+    helper uses this to populate
+    :attr:`WeightClassification.expert_idx`."""
+    attention_type_pattern: Optional[re.Pattern] = None
+    """Regex matching weight names that belong to linear-attention
+    layers (DeltaNet, Mamba, RWKV) in hybrid architectures.
+    ``None`` = standard attention only. When set, the base
+    :meth:`ArchitectureAdapter._detect_attention_type` helper
+    tags weights with ``attention_type="linear"`` if they match,
+    ``"full"`` otherwise."""
 
 
 class ArchitectureAdapter:
@@ -154,3 +173,48 @@ class ArchitectureAdapter:
             name for name, cls in classifications.items()
             if cls.category == "ternary_eligible"
         ]
+
+    def _extract_expert_idx(self, name: str) -> Optional[int]:
+        """Extract MoE expert index from a weight name.
+
+        Uses ``self.info().expert_pattern``. Returns ``None`` if no
+        pattern is declared on this adapter (non-MoE) or if the
+        pattern does not match this name. The pattern must declare
+        a named group ``"expert_idx"`` capturing the integer.
+
+        Concrete default — not expected to be overridden. MoE
+        adapters declare ``expert_pattern`` in ``info()`` and
+        inherit this helper.
+        """
+        pattern = self.info().expert_pattern
+        if pattern is None:
+            return None
+        match = pattern.search(name)
+        if match is None:
+            return None
+        try:
+            return int(match.group("expert_idx"))
+        except (IndexError, ValueError):
+            return None
+
+    def _detect_attention_type(
+        self,
+        name: str,
+    ) -> Optional[Literal["full", "linear"]]:
+        """Detect attention layer type for hybrid architectures.
+
+        Uses ``self.info().attention_type_pattern``. Returns
+        ``None`` if no pattern is declared (adapter does not
+        distinguish), ``"linear"`` if the name matches the
+        linear-attention pattern, ``"full"`` otherwise.
+
+        Concrete default — not expected to be overridden. Hybrid
+        adapters declare ``attention_type_pattern`` in ``info()``
+        and inherit this helper.
+        """
+        pattern = self.info().attention_type_pattern
+        if pattern is None:
+            return None
+        if pattern.search(name):
+            return "linear"
+        return "full"
