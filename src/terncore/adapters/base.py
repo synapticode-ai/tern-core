@@ -124,3 +124,33 @@ class ArchitectureAdapter:
             if re.search(pattern, name):
                 return "projector"
         return "language"
+
+    def classify_all(
+        self,
+        weight_shapes: dict[str, list[int]],
+    ) -> dict[str, WeightClassification]:
+        """Classify every weight in the dict.
+
+        Concrete default — calls :meth:`classify_weight` on each
+        name paired with its shape. Not expected to be overridden;
+        ``classify_weight`` is the per-weight policy hook.
+        """
+        return {
+            name: self.classify_weight(name, shape)
+            for name, shape in weight_shapes.items()
+        }
+
+    def get_ternary_eligible(
+        self,
+        weight_shapes: dict[str, list[int]],
+    ) -> list[str]:
+        """Return weight names that classify as ``"ternary_eligible"``.
+
+        Concrete default — filters :meth:`classify_all` results by
+        category. Not expected to be overridden.
+        """
+        classifications = self.classify_all(weight_shapes)
+        return [
+            name for name, cls in classifications.items()
+            if cls.category == "ternary_eligible"
+        ]

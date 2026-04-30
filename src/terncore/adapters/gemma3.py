@@ -150,30 +150,3 @@ class Gemma3Adapter(ArchitectureAdapter):
             reason="2-D weight in transformer block",
             component=component,
         )
-
-    def classify_all(
-        self,
-        weight_names: dict[str, list[int]],
-    ) -> dict[str, WeightClassification]:
-        return {
-            name: self.classify_weight(name, shape)
-            for name, shape in weight_names.items()
-        }
-
-    def get_protection_list(
-        self,
-        weight_names: dict[str, list[int]],
-    ) -> list[str]:
-        return [
-            name for name, cls in self.classify_all(weight_names).items()
-            if cls.category == "fp16_retain"
-        ]
-
-    def get_ternary_eligible(
-        self,
-        weight_names: dict[str, list[int]],
-    ) -> list[str]:
-        return [
-            name for name, cls in self.classify_all(weight_names).items()
-            if cls.category == "ternary_eligible"
-        ]
