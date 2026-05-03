@@ -239,6 +239,86 @@ class TernaryEngine:
 
 
 # ---------------------------------------------------------------------------
+# Format conversion: uint8 (CPU pack) → uint32 (Metal pack)
+# ---------------------------------------------------------------------------
+
+def repack_uint8_to_uint32_codes(
+    packed_uint8: "torch.Tensor",
+    in_features: int,
+    out_features: int,
+) -> "torch.Tensor":
+    """Repack uint8 (4 trits/byte) ternary codes into uint32 (16 trits/word).
+
+    Both formats use the same trit encoding (01=+1, 10=-1, 00=0) and the
+    same LSB-first 2-bit-slot layout. A uint32 word is structurally four
+    consecutive uint8 bytes interpreted little-endian; this function
+    performs the regroup and the byte-to-word composition.
+
+    Required for handing off CPU-side ``PackedTernaryLinear.packed_weights``
+    (uint8 layout, consumed by the CPU C kernel) to ``TernaryEngine.matvec``
+    / ``matvec_gpu`` (uint32 layout, required by the Metal shader).
+
+    Args:
+        packed_uint8: Uint8 tensor of size ``out_features * (in_features // 4)``
+            (flat) or shape ``(out_features, in_features // 4)`` (2D).
+        in_features: K dimension. Must be divisible by 16 to feed the
+            ``tern_matvec_fast`` Metal kernel.
+        out_features: M dimension.
+
+    Returns:
+        Int64 tensor of shape ``(out_features, in_features // 16)`` whose
+        values are the packed uint32 codes. Caller converts to numpy
+        ``uint32`` at the boundary (PyTorch lacks a native uint32 dtype).
+    """
+    import torch
+    if in_features % 16 != 0:
+        raise ValueError(
+            f"in_features must be divisible by 16 for Metal kernel "
+            f"(got {in_features}). The fast Metal variant requires "
+            f"K % 16 == 0; all transformer hidden-dim layers satisfy this."
+        )
+    M = out_features
+    K = in_features
+    bytes_per_row = K // 4
+    words_per_row = K // 16
+
+    if packed_uint8.dim() == 1:
+        if packed_uint8.numel() != M * bytes_per_row:
+            raise ValueError(
+                f"Flat uint8 tensor has {packed_uint8.numel()} elements, "
+                f"expected {M * bytes_per_row} for ({M}, {K})"
+            )
+        packed_2d = packed_uint8.view(M, bytes_per_row)
+    elif packed_uint8.dim() == 2:
+        if tuple(packed_uint8.shape) != (M, bytes_per_row):
+            raise ValueError(
+                f"2D uint8 tensor has shape {tuple(packed_uint8.shape)}, "
+                f"expected ({M}, {bytes_per_row})"
+            )
+        packed_2d = packed_uint8
+    else:
+        raise ValueError(
+            f"packed_uint8 must be 1D or 2D, got {packed_uint8.dim()}D"
+        )
+
+    if packed_2d.dtype != torch.uint8:
+        raise TypeError(
+            f"packed_uint8 must be uint8, got {packed_2d.dtype}"
+        )
+
+    # Group bytes 4-at-a-time → (M, words_per_row, 4); promote so the
+    # left-shifts don't overflow uint8.
+    grouped = packed_2d.view(M, words_per_row, 4).to(torch.int64)
+    words = (
+        grouped[..., 0]
+        | (grouped[..., 1] << 8)
+        | (grouped[..., 2] << 16)
+        | (grouped[..., 3] << 24)
+    )
+    return words
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
