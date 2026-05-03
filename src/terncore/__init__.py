@@ -14,7 +14,7 @@ __version__ = "0.4.0"
 from terncore.arithmetic.quantizer import TernaryQuantizer
 from terncore.arithmetic.linear import TernaryLinear
 from terncore.engine.inference import TernaryInferenceEngine
-from terncore.model_loader.tern_model import TernModelWriter, TernModelReader
+from terncore.tern_model import TernModelWriter, TernModelReader
 from terncore.autoscan import auto_scan, ScanResult
 
 # v0.2.0 — Ternary Confidence Layer

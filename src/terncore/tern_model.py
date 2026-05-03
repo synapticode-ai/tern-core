@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from terncore.arithmetic.quantizer import TernaryQuantizer
 from terncore.sparse import pack_ternary_weights, unpack_ternary_weights
@@ -37,6 +37,25 @@ TERN_MAGIC_REVERSE = b"NRET"
 TERN_VERSION = 2
 HEADER_SIZE = 256
 ALIGNMENT = 32  # 32-byte SIMD boundary (AVX2)
+
+
+# ── Known transformers-API drift presets ─────────────────────────────
+# Used as `key_mapping=` argument on load_as_model / load_packed_model
+# to translate manifest prefixes when the source model class hierarchy
+# has been reorganised since the artefact was packed.
+#
+# Gemma 4 multimodal: artefacts packed against pre-5.5 transformers had
+# text-tower components at `model.embed_tokens.*` etc.; transformers 5.5+
+# moved these under `model.language_model.*`. Audio/vision paths align
+# in both layouts and need no rewrite.
+GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
+    "model.embed_tokens.": "model.language_model.embed_tokens.",
+    "model.embed_tokens_per_layer.": "model.language_model.embed_tokens_per_layer.",
+    "model.layers.": "model.language_model.layers.",
+    "model.norm.": "model.language_model.norm.",
+    "model.per_layer_model_projection.": "model.language_model.per_layer_model_projection.",
+    "model.per_layer_projection_norm.": "model.language_model.per_layer_projection_norm.",
+}
 
 
 def _align_to(offset: int, alignment: int = ALIGNMENT) -> int:
@@ -974,6 +993,7 @@ class TernModelReader:
         self,
         model: nn.Module,
         strict: bool = False,
+        key_mapping: Optional[Dict[str, str]] = None,
     ) -> Tuple[list[str], list[str]]:
         """
         Reconstruct state_dict and load into an existing model.
@@ -981,11 +1001,25 @@ class TernModelReader:
         Args:
             model:  PyTorch model instance to load weights into.
             strict: If True, raise on missing/unexpected keys.
+            key_mapping: Optional prefix-rewrite map applied to state_dict
+                keys before load_state_dict. Use named presets like
+                GEMMA4_MULTIMODAL_TRANSFORMERS_5_5 to bridge transformers
+                API drift between artefact pack-time and load-time.
 
         Returns:
             (missing_keys, unexpected_keys) from load_state_dict.
         """
         state_dict = self.reconstruct_all()
+        if key_mapping:
+            rewritten: dict[str, torch.Tensor] = {}
+            for k, v in state_dict.items():
+                new_k = k
+                for src, dst in key_mapping.items():
+                    if k.startswith(src):
+                        new_k = dst + k[len(src):]
+                        break
+                rewritten[new_k] = v
+            state_dict = rewritten
         result = model.load_state_dict(state_dict, strict=strict)
         return list(result.missing_keys), list(result.unexpected_keys)
 
