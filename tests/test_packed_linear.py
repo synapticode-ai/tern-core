@@ -380,3 +380,61 @@ class TestTernModelReaderPacked:
             assert output.shape == (2, 8)
         finally:
             Path(path).unlink(missing_ok=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# MPS device fallback discipline
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestMPSFallback:
+    """Verify the TypeError fallback path through F.linear for MPS-resident
+    inputs. After Commit 4 added the Metal-aware forward, MPS inputs route
+    through the Metal kernel by default; this test forces Metal unavailable
+    via monkeypatch to specifically exercise the C-kernel→TypeError-catch→
+    F.linear reference fallback path that Commit 3 fixed."""
+
+    @pytest.mark.skipif(
+        not torch.backends.mps.is_available(),
+        reason="MPS unavailable on this host",
+    )
+    def test_mps_input_falls_back_without_crash(self, monkeypatch):
+        """Forces Metal unavailable via monkeypatch to verify the TypeError
+        fallback path through F.linear works correctly. Independent
+        regression guard against the CPU C kernel path crashing on
+        MPS-resident packed_weights.numpy() calls (Commit 3 fix).
+
+        With Metal forced unavailable, the test exercises the F.linear
+        reference path (float32 precision); 1e-4 tolerance is correct
+        for that path. The implicit secondary assertion: if the
+        monkeypatch silently failed and Metal ran, divergence would be
+        ~5e-4 (float16 precision) and the assert would fail loudly."""
+        # Force Metal unavailable so PackedTernaryLinear.forward falls
+        # through to the CPU C kernel path → TypeError catch →
+        # F.linear reference. _initialise_metal_buffers re-imports
+        # get_engine from terncore.metal_runtime each call, so patching
+        # at the source module is sufficient.
+        monkeypatch.setattr("terncore.metal_runtime.get_engine", lambda: None)
+
+        torch.manual_seed(500)
+        linear = nn.Linear(64, 32, bias=True)
+        packed = PackedTernaryLinear.from_float(linear, threshold=0.7)
+        packed.eval()
+
+        x_cpu = torch.randn(4, 64)
+        with torch.no_grad():
+            cpu_out = packed(x_cpu)
+
+        packed_mps = packed.to("mps")
+        x_mps = x_cpu.to("mps")
+        with torch.no_grad():
+            mps_out = packed_mps(x_mps)
+
+        assert mps_out.device.type == "mps", (
+            f"expected MPS-resident output, got {mps_out.device}"
+        )
+        mps_out_cpu = mps_out.cpu()
+        max_diff = (cpu_out - mps_out_cpu).abs().max().item()
+        assert torch.allclose(cpu_out, mps_out_cpu, atol=1e-4), (
+            f"MPS vs CPU divergence: {max_diff} (atol=1e-4)"
+        )

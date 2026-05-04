@@ -143,7 +143,7 @@ def packed_ternary_matmul_fast(
                     *x_shape[:-1], out_features
                 )
                 return result
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError, TypeError):
         pass
 
     # Fallback: unpack → float → F.linear

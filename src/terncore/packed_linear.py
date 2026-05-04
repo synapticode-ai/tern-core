@@ -96,6 +96,14 @@ class PackedTernaryLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        # Metal kernel state — lazy-allocated on first MPS-device forward.
+        # Not registered buffers (those are autograd-tracked tensors); these
+        # are GPUBuffer handles into the Metal engine's command-allocator pool.
+        self._metal_buffers_initialised: bool = False
+        self._metal_engine = None
+        self._metal_codes_buf = None
+        self._metal_scales_buf = None
+
     @classmethod
     def from_float(
         cls,
@@ -233,12 +241,85 @@ class PackedTernaryLinear(nn.Module):
 
         return layer
 
+    def _initialise_metal_buffers(self) -> None:
+        """One-shot lazy init of GPU-resident weight buffers.
+
+        Called from the first MPS forward. If Metal is unavailable, sets
+        the initialised flag True with engine=None so the caller falls
+        back without retrying.
+        """
+        import numpy as np
+        from terncore.metal_runtime import get_engine
+        from terncore.ternary_metal import repack_uint8_to_uint32_codes
+
+        self._metal_buffers_initialised = True  # one-shot, sticky on failure
+        self._metal_engine = get_engine()
+        if self._metal_engine is None:
+            return  # Metal unavailable — caller falls through to CPU path
+
+        # Repack uint8 (CPU layout) → uint32 (Metal layout). packed_weights
+        # may be MPS-resident if the layer was .to("mps")'d; .cpu() is a
+        # no-op when already on CPU.
+        codes = repack_uint8_to_uint32_codes(
+            self.packed_weights.cpu(), self.in_features, self.out_features,
+        )
+        codes_u32_np = codes.numpy().astype(np.uint32)
+        scales_np = np.full(self.out_features, self.alpha.item(), dtype=np.float32)
+
+        self._metal_codes_buf = self._metal_engine.create_buffer(codes_u32_np)
+        self._metal_scales_buf = self._metal_engine.create_buffer(scales_np)
+
+    def _forward_metal(self, x: torch.Tensor) -> torch.Tensor:
+        """Metal-dispatch forward.
+
+        Inputs/outputs round-trip CPU per call (transient input_buf and
+        output_buf); weights stay GPU-resident across forwards via
+        _metal_codes_buf and _metal_scales_buf.
+        """
+        import numpy as np
+
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        batch = x_2d.shape[0]
+
+        x_np = np.ascontiguousarray(
+            x_2d.detach().cpu().numpy(), dtype=np.float16
+        )
+        input_buf = self._metal_engine.create_buffer(x_np)
+        output_buf = self._metal_engine.create_buffer(
+            size=batch * self.out_features * 2  # 2 bytes per float16
+        )
+
+        self._metal_engine.matvec_gpu(
+            self._metal_codes_buf, self._metal_scales_buf,
+            input_buf, output_buf,
+            M=self.out_features, K=self.in_features, B=batch, fast=True,
+        )
+
+        output_np = output_buf.read(
+            dtype=np.float16, shape=(batch, self.out_features)
+        )
+        output = torch.from_numpy(output_np.astype(np.float32)).to(x.device)
+        output = output.reshape(*x_shape[:-1], self.out_features)
+
+        if self.bias is not None:
+            output = output + self.bias  # bias on caller device
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass using packed weights with cached bitmap zero-skip.
+        Forward pass.
 
-        Uses the C kernel fast path with pre-built sparsity bitmap when
-        available. Falls back to unpack → float → F.linear.
+        Branches on input device:
+        - MPS-resident inputs dispatch through the Metal kernel via lazy-
+          allocated GPU-resident weight buffers (one-shot init on first
+          MPS forward).
+        - CPU inputs go through the existing C kernel fast path with
+          cached sparsity bitmap zero-skip.
+
+        If Metal is unavailable on an MPS input, falls through to the CPU
+        path which itself falls through to the F.linear reference via the
+        TypeError catch in packed_ternary_matmul_fast.
 
         Patent 7: Cached bitmap eliminates per-call bitmap rebuild.
         Patent 9: Zero-skip via bitmap-driven sparse kernel.
@@ -249,6 +330,13 @@ class PackedTernaryLinear(nn.Module):
         Returns:
             Output tensor (..., out_features).
         """
+        if x.device.type == "mps":
+            if not self._metal_buffers_initialised:
+                self._initialise_metal_buffers()
+            if self._metal_engine is not None:
+                return self._forward_metal(x)
+            # else: fall through to CPU path
+
         output = packed_ternary_matmul_fast(
             x,
             self.packed_weights,

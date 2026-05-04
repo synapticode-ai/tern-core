@@ -54,6 +54,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests that take >5s (deselect with -m 'not slow')",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::FutureWarning",
