@@ -635,6 +635,7 @@ def run_terncore_packed(artefact_path: str, hf_id: str, prompt: str,
     import transformers
     from terncore.tern_model import (
         TernModelReader, GEMMA4_MULTIMODAL_TRANSFORMERS_5_5,
+        derive_protection_list_from_manifest,
     )
     from terncore.packed_linear import (
         PackedTernaryLinear, convert_model_to_packed,
@@ -658,19 +659,39 @@ def run_terncore_packed(artefact_path: str, hf_id: str, prompt: str,
 
     # Decoupled load: state_dict via load_as_model + key_mapping, then
     # convert eligible Linear layers to PackedTernaryLinear (with
-    # Metal-aware forward).
+    # Metal-aware forward) using a manifest-derived protection_list to
+    # preserve the FP16 layers declared in the artefact (audio/vision
+    # encoders, projectors, embeddings — the canonical configuration
+    # established 2026-05-03 Phase 2 Stage C: 258 packed / 335 protected).
     reader = TernModelReader(str(artefact_path))
-    reader.load_as_model(
+    missing, unexpected = reader.load_as_model(
         model, strict=False,
         key_mapping=GEMMA4_MULTIMODAL_TRANSFORMERS_5_5,
     )
-    convert_stats = convert_model_to_packed(model, threshold=DEFAULT_THRESHOLD)
+    print(
+        f"  [info] load_as_model: missing={len(missing)} unexpected={len(unexpected)}",
+        file=sys.stderr,
+    )
+    protection_list = derive_protection_list_from_manifest(
+        reader, key_mapping=GEMMA4_MULTIMODAL_TRANSFORMERS_5_5,
+    )
+    convert_stats = convert_model_to_packed(
+        model, threshold=DEFAULT_THRESHOLD, protection_list=protection_list,
+    )
     print(
         f"  [info] convert_model_to_packed: "
         f"packed_layers={convert_stats['packed_layers']} "
         f"protected_layers={convert_stats['protected_layers']} "
         f"total_layers={convert_stats['total_layers']}",
         file=sys.stderr,
+    )
+    # Configurational fidelity assertion — guards against regression to
+    # over-ternisation (cf. pattern_integration_test_configurational_fidelity_v1).
+    # Saturday baseline = 258 packed; 350 leaves headroom for minor
+    # transformers-version drift in counted Linear instances.
+    assert convert_stats["packed_layers"] < 350, (
+        f"unexpectedly high packed_layers count {convert_stats['packed_layers']} "
+        f"— suggests protection_list derivation didn't capture all FP16 layers"
     )
 
     model = model.to("mps")
