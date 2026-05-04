@@ -177,3 +177,128 @@ def test_packed_layer_lazy_buffer_allocation():
 
     assert id(packed._metal_codes_buf) == codes_id
     assert id(packed._metal_scales_buf) == scales_id
+
+
+@pytest.mark.slow
+def test_production_data_e2e_gemopus():
+    """End-to-end integration on the real gemopus-4-e4b .tern-model artefact.
+
+    Loads via the decoupled path (load_as_model + key_mapping +
+    convert_model_to_packed), moves to MPS, runs 5-token generation through
+    PackedTernaryLinear.forward's Metal kernel path. Verifies the entire
+    Phase 2.5 stack works on real production data without crashing and
+    produces structurally coherent output.
+
+    The Metal-path-taken assertion verifies at least one PackedTernaryLinear
+    layer has Metal active; a stronger "most layers" assertion is deferred
+    to future work since per-layer Metal failures (e.g., K not divisible by
+    16 on some shape) are valid edge cases at this verification stage.
+
+    Skips when the artefact, Metal, MPS, or transformers/Gemma 4 are
+    unavailable. ~180-300 s runtime dominated by the 8.9 GiB artefact load
+    and the random-init 8B model construction."""
+    import gc
+    from pathlib import Path
+
+    artefact_path = Path(
+        "/Volumes/Syn Archive/models/compressed/gemopus-4-e4b/"
+        "gemopus_4_e4b_ternary_v0.1.0.tern-model/model.tern-model"
+    )
+    if not artefact_path.exists():
+        pytest.skip(f"artefact not present at {artefact_path}")
+
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS unavailable on this host")
+
+    _metal_or_skip()
+
+    try:
+        from transformers import AutoConfig, AutoTokenizer
+        import transformers
+    except ImportError:
+        pytest.skip("transformers not installed")
+
+    from terncore.tern_model import (
+        TernModelReader, GEMMA4_MULTIMODAL_TRANSFORMERS_5_5,
+    )
+    from terncore.packed_linear import PackedTernaryLinear, convert_model_to_packed
+
+    # Cheap insurance against accumulated state from prior tests in the
+    # session affecting this high-memory load.
+    gc.collect()
+
+    HF_ID = "Jackrong/Gemopus-4-E4B-it"
+
+    # Architecture from cached HF config; instantiate via the class the
+    # config declares (robust to future Gemma 4 class renames).
+    config = AutoConfig.from_pretrained(HF_ID)
+    arch_name = config.architectures[0]
+    if not hasattr(transformers, arch_name):
+        pytest.skip(f"transformers lacks {arch_name} (version mismatch)")
+    ModelClass = getattr(transformers, arch_name)
+
+    # Random-init in FP16 to fit the M4 Pro memory budget; weights are
+    # immediately overwritten by the .tern-model load.
+    model = ModelClass._from_config(config, dtype=torch.float16)
+    model.eval()
+
+    # Decoupled load: state_dict via load_as_model + key_mapping, then
+    # convert eligible Linear layers to PackedTernaryLinear.
+    reader = TernModelReader(str(artefact_path))
+    missing, unexpected = reader.load_as_model(
+        model, strict=False,
+        key_mapping=GEMMA4_MULTIMODAL_TRANSFORMERS_5_5,
+    )
+    # STATUS_PHASE2.md established baseline: 1 missing (lm_head tied),
+    # 54 unexpected (sliding-window KV pruning). Test doesn't assert exact
+    # counts (transformers version drift could shift them), only that load
+    # completed.
+
+    stats = convert_model_to_packed(model, threshold=0.7)
+    assert stats["packed_layers"] > 0, (
+        f"convert_model_to_packed produced zero packed layers: {stats}"
+    )
+
+    packed_layers = [
+        m for m in model.modules() if isinstance(m, PackedTernaryLinear)
+    ]
+    assert len(packed_layers) > 0
+
+    model = model.to("mps")
+
+    tokenizer = AutoTokenizer.from_pretrained(HF_ID)
+    messages = [{"role": "user", "content": "Hello"}]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to("mps")
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs, max_new_tokens=5, do_sample=False,
+        )
+
+    new_tokens = output_ids[0, inputs["input_ids"].shape[1]:]
+    output_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    print(f"\n[gemopus-4-e4b e2e] generated: {output_text!r}", flush=True)
+
+    assert len(output_text) > 0, "empty generation output"
+    assert any(c.isprintable() and not c.isspace() for c in output_text), (
+        f"generation output lacks printable content: {output_text!r}"
+    )
+
+    metal_path_taken = any(
+        layer._metal_buffers_initialised and layer._metal_engine is not None
+        for layer in packed_layers
+    )
+    assert metal_path_taken, (
+        "no PackedTernaryLinear layer initialised Metal buffers — "
+        "generation ran entirely through the F.linear fallback"
+    )
+
+    # Resource cleanup — release ~10 GB of MPS allocation before next test.
+    del model, packed_layers, reader, tokenizer
+    gc.collect()
+    if hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
