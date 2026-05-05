@@ -35,6 +35,11 @@ dev = [
     "black>=23.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    # Required by benchmarks/analyse_per_expert_tolerance.py; declared
+    # in dev so test collection of tests/test_analyse_per_expert_tolerance.py
+    # succeeds on CI.
+    "scipy>=1.11.0",
+    "matplotlib>=3.7.0",
 ]
 transformers = [
     "transformers>=4.30.0",
