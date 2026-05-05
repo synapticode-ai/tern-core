@@ -58,6 +58,21 @@ GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
 }
 
 
+# ── Manifest naming convention ───────────────────────────────────────
+# Production .tern-model artefacts (e.g. gemopus-4-e4b) store manifest
+# entry names that already include parameter/buffer suffixes, while test
+# fixtures use bare layer names. reconstruct_all detects the convention
+# per-entry by suffix matching against this list. Empirically derived
+# from the gemopus-4-e4b manifest; extend as additional production
+# manifest formats are encountered.
+_PRODUCTION_NAME_SUFFIXES = (
+    ".weight", ".bias",
+    ".input_max", ".input_min", ".output_max", ".output_min",
+    ".layer_scalar", ".per_dim_scale",
+    ".position_embedding_table",
+)
+
+
 def _align_to(offset: int, alignment: int = ALIGNMENT) -> int:
     """Round offset up to the next alignment boundary."""
     remainder = offset % alignment
@@ -977,16 +992,30 @@ class TernModelReader:
         """
         Reconstruct all layers as a flat state_dict-compatible dict.
 
+        Supports two manifest conventions detected per-entry by suffix:
+        - Test convention: bare layer names (e.g. "fc1"). Method appends
+          ".weight" / ".bias" suffixes to produce parameter keys.
+        - Production convention: names already include parameter/buffer
+          suffix (".weight", ".input_max", etc.). Method uses names as-is.
+
         Returns:
-            {"layer.name.weight": tensor, "layer.name.bias": tensor, ...}
+            Dict mapping parameter/buffer keys to reconstructed tensors.
         """
         state_dict: dict[str, torch.Tensor] = {}
         for entry in self.manifest["layers"]:
             name = entry["name"]
             tensors = self.reconstruct_layer(name)
-            state_dict[f"{name}.weight"] = tensors["weight"]
-            if "bias" in tensors:
-                state_dict[f"{name}.bias"] = tensors["bias"]
+            if name.endswith(_PRODUCTION_NAME_SUFFIXES):
+                # Production convention: name is already a parameter/buffer key
+                state_dict[name] = tensors["weight"]
+                if "bias" in tensors and name.endswith(".weight"):
+                    bias_key = name[:-len(".weight")] + ".bias"
+                    state_dict[bias_key] = tensors["bias"]
+            else:
+                # Test convention: append .weight / .bias suffixes
+                state_dict[f"{name}.weight"] = tensors["weight"]
+                if "bias" in tensors:
+                    state_dict[f"{name}.bias"] = tensors["bias"]
         return state_dict
 
     def load_as_model(
@@ -1160,3 +1189,56 @@ class TernModelReader:
         missing = [k for k in model_keys if k not in loaded_keys]
         unexpected = [k for k in loaded_keys if k not in model_keys]
         return missing, unexpected
+
+
+def derive_protection_list_from_manifest(
+    reader: "TernModelReader",
+    key_mapping: Optional[Dict[str, str]] = None,
+) -> list[str]:
+    """Derive a protection_list from a .tern-model manifest's per-layer
+    dtype declarations, suitable for passing to convert_model_to_packed.
+
+    Iterates manifest entries; collects every entry with dtype == "float16"
+    as protected. Ternary entries (the layers we WANT to convert to
+    PackedTernaryLinear) and int4 entries (intentionally allowed to be
+    re-ternised to match the 2026-05-03 Phase 2 Stage C baseline for
+    gemopus-4-e4b) are omitted from the list.
+
+    Applies key_mapping prefix rewrite (use the same mapping passed to
+    load_as_model so the derived list aligns with runtime
+    model.named_modules() output) then strips trailing ".weight" suffix
+    (manifest stores parameter names; protection_list matches against
+    module names).
+
+    The resulting list intentionally over-includes manifest entries that
+    don't correspond to nn.Linear modules in the runtime model (e.g.
+    embeddings, layernorms, calibration tensors). convert_model_to_packed
+    only iterates Linear instances, so these extras are harmless.
+
+    Args:
+        reader: TernModelReader with parsed manifest.
+        key_mapping: Optional prefix-rewrite map (same format as
+            load_as_model); pass the same mapping used at load_as_model
+            time.
+
+    Returns:
+        List of layer names in model.named_modules() format. For the
+        canonical gemopus-4-e4b artefact, returns 1836 entries (float16
+        only); after convert_model_to_packed filters to actual Linear
+        instances, expect Saturday's baseline: 258 packed / 335 protected
+        / 593 total.
+    """
+    protection_list: list[str] = []
+    for entry in reader.manifest["layers"]:
+        if entry["dtype"] != "float16":
+            continue
+        name = entry["name"]
+        if key_mapping:
+            for src, dst in key_mapping.items():
+                if name.startswith(src):
+                    name = dst + name[len(src):]
+                    break
+        if name.endswith(".weight"):
+            name = name[:-len(".weight")]
+        protection_list.append(name)
+    return protection_list
