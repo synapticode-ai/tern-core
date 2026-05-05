@@ -257,9 +257,23 @@ beyond the Apple conversation.
 compression on MoE architecture remains largely unexplored. Key
 hypothesis: inactive expert weights — those the router skips for a
 given token — cluster toward the zero-state at higher rates than
-dense layer weights. If confirmed, the ternary tolerance ratio for a
-MoE model could significantly exceed the 22.3 % achieved on
-Mistral-7B.
+dense layer weights within the same model. If confirmed, the
+per-expert zero-state ratio distribution will show a meaningful
+right-shift relative to the dense (non-expert) weights' distribution,
+providing within-model evidence for ternary's particular suitability
+to MoE expert sparsity.
+
+*(Metric note: this hypothesis is about per-tensor zero-state ratio
+under threshold quantisation. The "22.3% achieved on Llama-3.1-70B"
+figure cited in `docs/TN-001_llama70b_compression_analysis.md` is a
+distinct architectural metric — fraction of Linear modules converted
+to ternary at threshold=0.7, 20% PPL headroom (125 of 560 modules)
+— and is not directly comparable. Cross-model zero-state-ratio
+comparisons require running the analysis on each model's compressed
+manifest using the same per-tensor metric;
+`benchmarks/analyse_per_expert_tolerance.py` computes this from
+`.tern-model` manifests, with `--llama70b-manifest` providing the
+Llama-3.1-70B reference data point from the artefact on archive.)*
 
 During compression, log ternary tolerance ratio **per-expert**, not
 just the aggregate. The per-expert distribution is the IP
