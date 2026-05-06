@@ -55,6 +55,24 @@ MODEL_GROUP_PATTERNS: dict[str, dict[str, list[str]]] = {
                         r"\.mlp\.down_proj\.weight$"],
         "attention":   [r"\.self_attn\.[qkvo]_proj\.weight$"],
     },
+    "phi3_dense": {
+        "expert_ffn":  [],  # Phi-3 / Phi-4 dense; no experts
+        # Phi-4 uses fused gate+up (gate_up_proj) + separate down_proj
+        "dense_ffn":   [r"\.mlp\.gate_up_proj\.weight$",
+                        r"\.mlp\.down_proj\.weight$"],
+        # Phi-4 uses fused QKV (qkv_proj) + separate o_proj
+        "attention":   [r"\.self_attn\.qkv_proj\.weight$",
+                        r"\.self_attn\.o_proj\.weight$"],
+    },
+    "qwen3_moe": {
+        # Qwen3 stores per-expert weights as separate gate/up/down
+        # 2-D indexed tensors (no fused gate_up like Gemma 4).
+        "expert_ffn":  [r"\.mlp\.experts\.\d+\.gate_proj\.weight$",
+                        r"\.mlp\.experts\.\d+\.up_proj\.weight$",
+                        r"\.mlp\.experts\.\d+\.down_proj\.weight$"],
+        "dense_ffn":   [],  # Qwen3 has NO parallel dense MLP (pure MoE FFN)
+        "attention":   [r"\.self_attn\.[qkvo]_proj\.weight$"],
+    },
     # Extend for new architectures by mirroring the gemma4_moe shape.
 }
 
