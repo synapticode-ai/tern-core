@@ -233,19 +233,25 @@ def _verify_one_manifest(label: str, output_dir: Path) -> None:
     reader = TernModelReader(str(manifest_path))
     entries = reader.manifest["layers"]
 
-    # Check 1: stacked entry count
+    # Check 1: stacked entry count.
+    # Expected: 60 parents × 128 experts = 7,680 stacked entries for 26B-A4B
+    # (2 stacked tensors per layer × 30 layers × 128 experts). Architecture
+    # is pinned; ±100 symmetric tolerance is generous slack for any future
+    # per-architecture variation.
     stacked = [e for e in entries if "stacked_parent" in e]
     parents = sorted({e["stacked_parent"] for e in stacked})
-    expected_stacked_lo = 7500  # 60 parents × 128 = 7680 expected; allow slack
-    expected_stacked_hi = 7800
-    if not (expected_stacked_lo <= len(stacked) <= expected_stacked_hi):
+    expected_stacked = 7680
+    stacked_tolerance = 100
+    if not (expected_stacked - stacked_tolerance <= len(stacked) <= expected_stacked + stacked_tolerance):
         raise ValueError(
             f"verify: stacked entry count {len(stacked)} outside "
-            f"[{expected_stacked_lo}, {expected_stacked_hi}] band"
+            f"[{expected_stacked - stacked_tolerance}, "
+            f"{expected_stacked + stacked_tolerance}] band "
+            f"(expected ~{expected_stacked})"
         )
     print(
         f"  [check 1] stacked entries: {len(stacked)} across "
-        f"{len(parents)} parents — PASS",
+        f"{len(parents)} parents (expected ~{expected_stacked}, ±{stacked_tolerance}) — PASS",
         flush=True,
     )
 
