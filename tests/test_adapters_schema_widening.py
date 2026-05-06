@@ -180,12 +180,19 @@ def test_detect_attention_type_returns_full_when_pattern_misses():
 
 @pytest.mark.parametrize(
     "adapter_cls",
-    [LlamaAdapter, Gemma3Adapter, Gemma4Adapter],
+    [LlamaAdapter, Gemma3Adapter],
 )
 def test_existing_adapters_have_none_for_new_info_fields(adapter_cls):
-    """Smoke positive: llama/gemma3/gemma4 declare neither
-    expert_pattern nor attention_type_pattern. The schema widening
-    must be a pure-additive no-op for non-MoE, non-hybrid adapters.
+    """Smoke positive: llama/gemma3 declare neither expert_pattern nor
+    attention_type_pattern. The Group A schema widening must be a
+    pure-additive no-op for non-MoE, non-hybrid adapters.
+
+    Gemma4Adapter was excluded from this list during the Session 3
+    per-expert slicing rework — it now legitimately declares an
+    ``expert_pattern`` so the inherited ``_extract_expert_idx`` helper
+    can populate ``WeightClassification.expert_idx`` from synthesised
+    per-expert names. That declaration is exercised by tests in
+    ``test_gemma4_adapter_stacked.py``.
     """
     info = adapter_cls().info()
     assert info.expert_pattern is None

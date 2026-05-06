@@ -183,6 +183,11 @@ class TernModelWriter:
         alpha: float,
         shape: list[int],
         sparsity_bitmap: Optional[bytes] = None,
+        *,
+        stacked_parent: Optional[str] = None,
+        stack_axis: Optional[int] = None,
+        stack_index: Optional[int] = None,
+        stack_total: Optional[int] = None,
         **metadata: Any,
     ) -> None:
         """
@@ -194,6 +199,22 @@ class TernModelWriter:
             alpha:           Per-layer scaling factor.
             shape:           Original weight shape, e.g. [2048, 2048].
             sparsity_bitmap: Optional sparsity bitmap bytes.
+            stacked_parent:  When this layer is one slice of a stacked tensor
+                             (e.g., a per-expert slice of a Gemma 4 MoE
+                             ``experts.gate_up_proj``), the bare safetensors
+                             entry name of the parent stacked tensor. The
+                             reader's ``reconstruct_all`` uses this to group
+                             slices and restack into the parent's 3-D shape.
+                             All four stacking fields are mutually required —
+                             either all four are provided (stacked slice case)
+                             or none are (standard tensor case). Mixed states
+                             raise ValueError.
+            stack_axis:      Axis along which the parent tensor was sliced
+                             (typically 0 for axis-0 stacked experts).
+            stack_index:     This slice's index along ``stack_axis``.
+            stack_total:     Total number of slices in the parent stack
+                             (used by the reader to verify completeness
+                             before restacking).
             **metadata:      Additional fields (threshold, sparsity, sensitivity_score,
                             quant_error, bias as torch.Tensor, etc.).
         """
@@ -209,7 +230,19 @@ class TernModelWriter:
             has_bias = True
             bias_bytes = bias_tensor.detach().float().numpy().tobytes()
 
-        self._layers.append({
+        # Stacking metadata: enforce all-four-or-none invariant. Convert.py
+        # builds these from a StackedSlice dataclass so they always arrive
+        # together; defensive guard catches future call sites that drift.
+        stacking_fields = (stacked_parent, stack_axis, stack_index, stack_total)
+        stacking_set = sum(1 for f in stacking_fields if f is not None)
+        if stacking_set not in (0, 4):
+            raise ValueError(
+                f"add_ternary_layer stacking metadata must be all-set or all-None; "
+                f"got stacked_parent={stacked_parent!r}, stack_axis={stack_axis!r}, "
+                f"stack_index={stack_index!r}, stack_total={stack_total!r}."
+            )
+
+        record = {
             "name": name,
             "dtype": "ternary2",
             "shape": shape,
@@ -225,7 +258,17 @@ class TernModelWriter:
             "_packed": packed_weights,
             "_bitmap": sparsity_bitmap,
             "_bias": bias_bytes,
-        })
+        }
+        # Stacking metadata included only when present — preserves byte-for-byte
+        # compatibility with pre-rework manifests and avoids null-spam across
+        # the ~7,800 per-expert entries of a 26B-A4B compressed manifest.
+        if stacked_parent is not None:
+            record["stacked_parent"] = stacked_parent
+            record["stack_axis"] = stack_axis
+            record["stack_index"] = stack_index
+            record["stack_total"] = stack_total
+
+        self._layers.append(record)
 
     def add_int4_layer(
         self,
@@ -992,18 +1035,90 @@ class TernModelReader:
         """
         Reconstruct all layers as a flat state_dict-compatible dict.
 
-        Supports two manifest conventions detected per-entry by suffix:
+        Supports three manifest conventions detected per-entry:
         - Test convention: bare layer names (e.g. "fc1"). Method appends
           ".weight" / ".bias" suffixes to produce parameter keys.
         - Production convention: names already include parameter/buffer
           suffix (".weight", ".input_max", etc.). Method uses names as-is.
+        - Stacked convention: entries with ``stacked_parent`` metadata
+          represent per-slice records of a stacked tensor (e.g., per-expert
+          slices of a Gemma 4 MoE ``experts.gate_up_proj``). Method
+          accumulates slices in-flight per parent and restacks immediately
+          when the per-parent slice count reaches ``stack_total``, freeing
+          the slice list before continuing iteration. The state_dict key
+          is the ``stacked_parent`` value verbatim.
+
+        Memory envelope for stacked entries: at most one parent's worth of
+        slices is held in memory at any time (~2 GB for a 26B-A4B
+        ``experts.gate_up_proj`` with 128 per-expert slices at FP32). This
+        relies on the writer (``convert.py:full_convert``) emitting all
+        slices for one parent contiguously in the manifest before moving
+        to the next stacked tensor — which it does because each stacked
+        parent is processed in a single inner loop.
+
+        Raises:
+            ValueError: when stacked-slice metadata is inconsistent within
+                a parent group (mismatched axes/totals), the slice count
+                doesn't match ``stack_total``, slice indices are not a
+                contiguous ``0..N-1`` range, or the manifest exhausts
+                with incomplete stacked-parent groups. Loud failure
+                preferred over silent reconstruction with missing slices.
 
         Returns:
             Dict mapping parameter/buffer keys to reconstructed tensors.
         """
         state_dict: dict[str, torch.Tensor] = {}
+        # In-flight stacked-parent slices: parent_name → list of
+        # (stack_index, tensor, stack_axis, stack_total). Entries removed
+        # from this dict immediately after restacking to bound memory.
+        stacked_groups: dict[str, list[tuple[int, torch.Tensor, int, int]]] = {}
+
         for entry in self.manifest["layers"]:
             name = entry["name"]
+            stacked_parent = entry.get("stacked_parent")
+            if stacked_parent is not None:
+                tensors = self.reconstruct_layer(name)
+                slices = stacked_groups.setdefault(stacked_parent, [])
+                slices.append((
+                    entry["stack_index"],
+                    tensors["weight"],
+                    entry["stack_axis"],
+                    entry["stack_total"],
+                ))
+                stack_total = entry["stack_total"]
+                if len(slices) == stack_total:
+                    # Group complete — validate, restack, emit, free.
+                    axes = {s[2] for s in slices}
+                    totals = {s[3] for s in slices}
+                    if len(axes) != 1 or len(totals) != 1:
+                        raise ValueError(
+                            f"Stacked-parent '{stacked_parent}' has inconsistent "
+                            f"slice metadata: axes={axes}, totals={totals}."
+                        )
+                    stack_axis = axes.pop()
+                    actual_total = totals.pop()
+                    if len(slices) != actual_total:
+                        raise ValueError(
+                            f"Stacked-parent '{stacked_parent}' incomplete: "
+                            f"expected {actual_total} slices, got {len(slices)}."
+                        )
+                    slices.sort(key=lambda s: s[0])
+                    actual_indices = [s[0] for s in slices]
+                    expected_indices = list(range(actual_total))
+                    if actual_indices != expected_indices:
+                        raise ValueError(
+                            f"Stacked-parent '{stacked_parent}' has non-contiguous "
+                            f"slice indices: expected {expected_indices}, "
+                            f"got {actual_indices}."
+                        )
+                    slice_tensors = [s[1] for s in slices]
+                    state_dict[stacked_parent] = torch.stack(
+                        slice_tensors, dim=stack_axis
+                    )
+                    # Free the per-slice tensors before continuing iteration.
+                    slices.clear()
+                    del stacked_groups[stacked_parent]
+                continue
             tensors = self.reconstruct_layer(name)
             if name.endswith(_PRODUCTION_NAME_SUFFIXES):
                 # Production convention: name is already a parameter/buffer key
@@ -1016,6 +1131,17 @@ class TernModelReader:
                 state_dict[f"{name}.weight"] = tensors["weight"]
                 if "bias" in tensors:
                     state_dict[f"{name}.bias"] = tensors["bias"]
+
+        # Any stacked groups still present here are incomplete — the writer
+        # never finished emitting all their slices. Loud failure rather than
+        # silent partial reconstruction.
+        if stacked_groups:
+            leftover = {p: f"{len(s)}/{s[0][3]}" for p, s in stacked_groups.items()}
+            raise ValueError(
+                f"Manifest exhausted with incomplete stacked-parent groups: "
+                f"{leftover}. Each parent reports (slices_seen / stack_total)."
+            )
+
         return state_dict
 
     def load_as_model(

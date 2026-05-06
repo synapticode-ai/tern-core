@@ -43,6 +43,38 @@ class WeightClassification:
     adapter does not distinguish (default for non-hybrid models)."""
 
 
+@dataclass(frozen=True)
+class StackedSlice:
+    """One per-slice expansion record for a stacked tensor.
+
+    Stacked tensors hold N logical Linear weights packed into a single
+    safetensors entry along an axis (e.g., MoE expert weights stored as
+    ``[num_experts, out_features, in_features]`` with axis 0 = expert
+    index). Adapters return a list of ``StackedSlice`` records from
+    :meth:`ArchitectureAdapter.expand_stacked` to instruct the converter
+    how to fan one parent tensor out into N independently-quantised
+    per-slice tensors with synthesised names.
+
+    The ``slice_axis`` records how the converter must slice the loaded
+    tensor (typically 0 for axis-0 stacking). The ``slice_index`` and
+    ``synthesised_name`` are paired — the converter loops indices in
+    order and uses the matching synthesised name as the manifest entry
+    name for the resulting ternary record.
+    """
+
+    synthesised_name: str
+    """Synthesised manifest entry name for this slice
+    (e.g., ``model.language_model.layers.0.experts.5.gate_up_proj.weight``)."""
+    slice_axis: int
+    """Axis along which to slice the parent tensor (typically 0)."""
+    slice_index: int
+    """Index along ``slice_axis`` for this slice."""
+    expert_idx: Optional[int] = None
+    """Integer expert index for MoE stacked-expert tensors. For
+    expert tensors this equals ``slice_index``; ``None`` for future
+    stacked-tensor patterns that aren't expert-indexed."""
+
+
 @dataclass
 class AdapterInfo:
     """Metadata about an architecture adapter."""
@@ -108,6 +140,39 @@ class ArchitectureAdapter:
             WeightClassification with category and reason.
         """
         raise NotImplementedError
+
+    def expand_stacked(
+        self,
+        name: str,
+        shape: list[int],
+    ) -> Optional[list["StackedSlice"]]:
+        """Return per-slice expansion plan for stacked tensors.
+
+        Stacked tensors pack N logical Linear weights into a single
+        safetensors entry along one axis (typically axis 0). MoE expert
+        weights are the canonical case — e.g., Gemma 4's
+        ``experts.gate_up_proj`` of shape ``[128, 1408, 2816]`` holds
+        128 per-expert projections that benefit from independent
+        quantisation (per-expert threshold and per-expert sparsity
+        recording for IP measurement).
+
+        Args:
+            name:  HuggingFace weight name.
+            shape: Tensor shape from the safetensors header.
+
+        Returns:
+            List of :class:`StackedSlice` records when ``name`` is a
+            stacked-tensor pattern this adapter recognises, ``None``
+            otherwise (the converter then processes the tensor as a
+            single Linear weight).
+
+        Default returns ``None`` — non-MoE / dense adapters opt out
+        implicitly. MoE adapters override to declare their stacked
+        patterns. The converter calls this during shape collection
+        and during per-tensor processing; both call sites accept
+        ``None`` as "process as a single tensor".
+        """
+        return None
 
     def normalize_name(self, name: str) -> str:
         """Strip architecture-specific prefixes to get a canonical name.
