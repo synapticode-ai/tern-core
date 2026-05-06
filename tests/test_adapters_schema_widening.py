@@ -26,6 +26,7 @@ from terncore.adapters.base import (
 from terncore.adapters.gemma3 import Gemma3Adapter
 from terncore.adapters.gemma4 import Gemma4Adapter
 from terncore.adapters.llama import LlamaAdapter
+from terncore.adapters.phi3 import Phi3Adapter
 
 
 _BLOCK_PATTERN = re.compile(r"\.layers\.(\d+)\.")
@@ -180,11 +181,11 @@ def test_detect_attention_type_returns_full_when_pattern_misses():
 
 @pytest.mark.parametrize(
     "adapter_cls",
-    [LlamaAdapter, Gemma3Adapter],
+    [LlamaAdapter, Gemma3Adapter, Phi3Adapter],
 )
 def test_existing_adapters_have_none_for_new_info_fields(adapter_cls):
-    """Smoke positive: llama/gemma3 declare neither expert_pattern nor
-    attention_type_pattern. The Group A schema widening must be a
+    """Smoke positive: llama/gemma3/phi3 declare neither expert_pattern
+    nor attention_type_pattern. The Group A schema widening must be a
     pure-additive no-op for non-MoE, non-hybrid adapters.
 
     Gemma4Adapter was excluded from this list during the Session 3
@@ -193,6 +194,15 @@ def test_existing_adapters_have_none_for_new_info_fields(adapter_cls):
     can populate ``WeightClassification.expert_idx`` from synthesised
     per-expert names. That declaration is exercised by tests in
     ``test_gemma4_adapter_stacked.py``.
+
+    Qwen3MoeAdapter is similarly excluded — it declares
+    ``expert_pattern`` for Qwen3's per-expert 2-D indexed tensors
+    (no expand_stacked needed; declaration is exercised by tests in
+    ``test_qwen3_moe_adapter.py``).
+
+    Phi3Adapter is dense (Phi-3 / Phi-4 with fused QKV + fused gate_up
+    treated as single tensors); included in this list to confirm the
+    schema-widening invariant holds.
     """
     info = adapter_cls().info()
     assert info.expert_pattern is None

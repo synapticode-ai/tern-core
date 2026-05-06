@@ -32,14 +32,14 @@ def test_get_adapter_raises_on_unknown_name_case_insensitive():
         get_adapter("LLAMA_FAKE")
 
 
-@pytest.mark.parametrize("name", ["llama", "gemma3", "gemma4"])
+@pytest.mark.parametrize("name", ["llama", "gemma3", "gemma4", "phi3", "qwen3_moe"])
 def test_get_adapter_returns_instance_for_each_known_name(name):
     adapter = get_adapter(name)
     assert isinstance(adapter, ArchitectureAdapter)
     assert adapter.info().name == name
 
 
-@pytest.mark.parametrize("name", ["LLAMA", "Gemma3", "GEMMA4"])
+@pytest.mark.parametrize("name", ["LLAMA", "Gemma3", "GEMMA4", "PHI3", "Qwen3_MoE"])
 def test_get_adapter_accepts_mixed_case_known_names(name):
     adapter = get_adapter(name)
     assert isinstance(adapter, ArchitectureAdapter)
@@ -47,4 +47,4 @@ def test_get_adapter_accepts_mixed_case_known_names(name):
 
 
 def test_known_adapters_is_canonical_source():
-    assert set(_KNOWN_ADAPTERS) == {"llama", "gemma3", "gemma4"}
+    assert set(_KNOWN_ADAPTERS) == {"llama", "gemma3", "gemma4", "phi3", "qwen3_moe"}
