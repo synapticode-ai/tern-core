@@ -183,6 +183,11 @@ class TernModelWriter:
         alpha: float,
         shape: list[int],
         sparsity_bitmap: Optional[bytes] = None,
+        *,
+        stacked_parent: Optional[str] = None,
+        stack_axis: Optional[int] = None,
+        stack_index: Optional[int] = None,
+        stack_total: Optional[int] = None,
         **metadata: Any,
     ) -> None:
         """
@@ -194,6 +199,22 @@ class TernModelWriter:
             alpha:           Per-layer scaling factor.
             shape:           Original weight shape, e.g. [2048, 2048].
             sparsity_bitmap: Optional sparsity bitmap bytes.
+            stacked_parent:  When this layer is one slice of a stacked tensor
+                             (e.g., a per-expert slice of a Gemma 4 MoE
+                             ``experts.gate_up_proj``), the bare safetensors
+                             entry name of the parent stacked tensor. The
+                             reader's ``reconstruct_all`` uses this to group
+                             slices and restack into the parent's 3-D shape.
+                             All four stacking fields are mutually required —
+                             either all four are provided (stacked slice case)
+                             or none are (standard tensor case). Mixed states
+                             raise ValueError.
+            stack_axis:      Axis along which the parent tensor was sliced
+                             (typically 0 for axis-0 stacked experts).
+            stack_index:     This slice's index along ``stack_axis``.
+            stack_total:     Total number of slices in the parent stack
+                             (used by the reader to verify completeness
+                             before restacking).
             **metadata:      Additional fields (threshold, sparsity, sensitivity_score,
                             quant_error, bias as torch.Tensor, etc.).
         """
@@ -209,7 +230,19 @@ class TernModelWriter:
             has_bias = True
             bias_bytes = bias_tensor.detach().float().numpy().tobytes()
 
-        self._layers.append({
+        # Stacking metadata: enforce all-four-or-none invariant. Convert.py
+        # builds these from a StackedSlice dataclass so they always arrive
+        # together; defensive guard catches future call sites that drift.
+        stacking_fields = (stacked_parent, stack_axis, stack_index, stack_total)
+        stacking_set = sum(1 for f in stacking_fields if f is not None)
+        if stacking_set not in (0, 4):
+            raise ValueError(
+                f"add_ternary_layer stacking metadata must be all-set or all-None; "
+                f"got stacked_parent={stacked_parent!r}, stack_axis={stack_axis!r}, "
+                f"stack_index={stack_index!r}, stack_total={stack_total!r}."
+            )
+
+        record = {
             "name": name,
             "dtype": "ternary2",
             "shape": shape,
@@ -225,7 +258,17 @@ class TernModelWriter:
             "_packed": packed_weights,
             "_bitmap": sparsity_bitmap,
             "_bias": bias_bytes,
-        })
+        }
+        # Stacking metadata included only when present — preserves byte-for-byte
+        # compatibility with pre-rework manifests and avoids null-spam across
+        # the ~7,800 per-expert entries of a 26B-A4B compressed manifest.
+        if stacked_parent is not None:
+            record["stacked_parent"] = stacked_parent
+            record["stack_axis"] = stack_axis
+            record["stack_index"] = stack_index
+            record["stack_total"] = stack_total
+
+        self._layers.append(record)
 
     def add_int4_layer(
         self,
