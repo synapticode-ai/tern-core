@@ -76,6 +76,15 @@ convention untested until Phase 2.
 
 ---
 
+### Llama-3.1-70B-Instruct source weights: download deferred
+
+**Status:** Open (low priority, future-when-needed)
+**Surfaced:** 2026-05-06 Wednesday-night queue planning
+**Observation:** License accepted on HF Hub 2026-04-09; source weights (~140 GB FP16) never pulled. Only `refs/main` SHA reference cached, no snapshots/blobs. The existing compressed `.tern-model` artefact at `/Volumes/Syn Archive/models/compressed/llama-3-1-70b/llama70b-v0.6.0-mixed.tern-model` (37 GB) already serves as cross-model reference for analysis work (used in Session 4 per-expert tolerance analysis 2026-05-06).
+**Resolution scope:** Fire `hf download meta-llama/Llama-3.1-70B-Instruct` when a specific need arises that the existing compressed artefact can't satisfy (e.g., recompression with v2 Metal forward path improvements, full-precision baseline experiments, cross-validation). ~140 GB / ~1-2 hours overnight.
+
+---
+
 ## Closed
 
 ### reconstruct_all suffix-doubling — production manifest support
