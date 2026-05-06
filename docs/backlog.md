@@ -57,6 +57,25 @@ convention untested until Phase 2.
 
 ---
 
+### Known architecture quirk: full_attention v_proj absence (gemma4 26B-A4B)
+
+**Status:** Open (low priority, investigate later)
+**Surfaced:** 2026-05-06 Session 3 design surface for per-expert slicing
+**Observation:** The 5 full_attention layers (indices 5, 11, 17, 23, 29) carry 5 self_attn entries instead of 6 — they have no v_proj.weight, while q_proj doubles to [8192, 2816] (matches global_head_dim=512). The 25 sliding_attention layers carry 6 self_attn entries with v_proj present.
+**Hypothesis:** Full-attention layers may reuse v from an adjacent layer or via a fused projection.
+**Investigation:** Not blocking; the count formula in the Session 3 per-expert slicing rework incorporates the asymmetry. Worth confirming the architectural intent for thoroughness.
+
+---
+
+### dry_run_convert: stacked-tensor expansion not modelled
+
+**Status:** Open (low priority, informational)
+**Surfaced:** 2026-05-06 Session 3 per-expert slicing rework
+**Observation:** `dry_run_convert` (`src/terncore/convert.py`) doesn't call `adapter.expand_stacked`, so MoE stacked-experts parent tensors (e.g., `experts.gate_up_proj` shape `[128, 1408, 2816]`) appear as 3-D ternary-eligible entries in the dry-run output rather than as 128 per-expert slices. Misleading for capacity planning on MoE models but doesn't affect actual compression correctness — `full_convert` (the active path) handles expansion correctly.
+**Resolution scope:** Mirror the `stacked_plans` pattern from `full_convert` in `dry_run_convert`. Estimated 1-2 hours focused engineering. Not blocking any current work.
+
+---
+
 ## Closed
 
 ### reconstruct_all suffix-doubling — production manifest support
