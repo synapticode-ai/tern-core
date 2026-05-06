@@ -39,6 +39,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from terncore.adapters.base import StackedSlice
 from terncore.arithmetic.quantizer import TernaryQuantizer
 from terncore.sparse import pack_ternary_weights
 from terncore.tern_model import TernModelWriter, TernModelReader
@@ -619,6 +620,12 @@ def full_convert(
     # ── Get shapes and classify ──
     _log(f"\n  Reading weight shapes...")
     weight_shapes: dict[str, list[int]] = {}
+    # Stacked-tensor expansion plan: maps each safetensors entry name that
+    # the adapter recognises as a stacked-tensor pattern (e.g., MoE
+    # ``experts.gate_up_proj``) to the list of per-slice StackedSlice
+    # records the per-tensor processing loop will fan it out into. Entries
+    # absent from this dict are processed as single tensors.
+    stacked_plans: dict[str, list[StackedSlice]] = {}
     # Group by file for efficient reading
     file_to_keys: dict[Path, list[str]] = {}
     for wname, fpath in weight_to_file.items():
@@ -627,7 +634,23 @@ def full_convert(
     for fpath, keys in file_to_keys.items():
         with safe_open(str(fpath), framework="pt", device="cpu") as f:
             for key in keys:
-                weight_shapes[key] = list(f.get_slice(key).get_shape())
+                parent_shape = list(f.get_slice(key).get_shape())
+                plan = adapter.expand_stacked(key, parent_shape)
+                if plan is None:
+                    weight_shapes[key] = parent_shape
+                else:
+                    stacked_plans[key] = plan
+                    per_slice_shape = [
+                        s for i, s in enumerate(parent_shape)
+                        if i != plan[0].slice_axis
+                    ]
+                    for slice_record in plan:
+                        weight_shapes[slice_record.synthesised_name] = list(per_slice_shape)
+
+    if stacked_plans:
+        _expanded = sum(len(p) for p in stacked_plans.values())
+        _log(f"  Stacked-tensor expansion: {len(stacked_plans)} parents → "
+             f"{_expanded} per-slice entries")
 
     _log(f"  Classifying {len(weight_shapes)} weights...")
     classifications = adapter.classify_all(weight_shapes)
@@ -690,11 +713,63 @@ def full_convert(
         "fp16_layers": 0, "fp16_params": 0,
     }
 
-    # Process file by file to minimise open/close overhead
+    # Process file by file to minimise open/close overhead.
+    # Stacked tensors (per ``stacked_plans``) are loaded once then sliced
+    # along the recorded axis; each per-expert slice is quantised
+    # independently so the resulting manifest carries per-expert
+    # threshold / alpha / sparsity (the IP measurement granularity).
+    # The inner slice loop emits all per-expert records for one parent
+    # contiguously before the outer loop advances to the next safetensors
+    # key — this contiguity is what bounds reader-side restack memory
+    # in TernModelReader.reconstruct_all to one parent at a time.
     for fpath, keys in file_to_keys.items():
         with safe_open(str(fpath), framework="pt", device="cpu") as f:
             for wname in sorted(keys):
                 tensor = f.get_tensor(wname)
+
+                if wname in stacked_plans:
+                    # Stacked tensor — fan out to per-slice ternary records.
+                    # All slices route to ternary by design: per-expert MoE
+                    # weights are precisely the IP measurement target. INT4
+                    # / FP16 routing for stacked patterns is not currently
+                    # supported (no use case; would require per-slice
+                    # routing decisions surfaced from the sensitivity map).
+                    plan = stacked_plans[wname]
+                    parent_canonical = adapter.normalize_name(wname)
+                    stack_total = len(plan)
+                    for slice_record in plan:
+                        slice_tensor = tensor.select(
+                            slice_record.slice_axis, slice_record.slice_index
+                        ).contiguous()
+                        slice_shape = list(slice_tensor.shape)
+                        slice_params = slice_tensor.numel()
+                        packed, alpha, bitmap, sparsity = (
+                            TernModelWriter.pack_ternary(
+                                slice_tensor.float(), threshold
+                            )
+                        )
+                        writer.add_ternary_layer(
+                            name=adapter.normalize_name(slice_record.synthesised_name),
+                            packed_weights=packed,
+                            alpha=alpha,
+                            shape=slice_shape,
+                            sparsity_bitmap=bitmap,
+                            threshold=threshold,
+                            sparsity=sparsity,
+                            stacked_parent=parent_canonical,
+                            stack_axis=slice_record.slice_axis,
+                            stack_index=slice_record.slice_index,
+                            stack_total=stack_total,
+                        )
+                        stats["ternary_layers"] += 1
+                        stats["ternary_params"] += slice_params
+                        del slice_tensor
+                        done += 1
+                        if done % 100 == 0 or done == total_weights:
+                            _log(f"    [{done}/{total_weights}] processed")
+                    del tensor
+                    continue
+
                 shape = list(tensor.shape)
                 num_params = tensor.numel()
                 canonical = adapter.normalize_name(wname)
