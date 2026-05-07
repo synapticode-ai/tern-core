@@ -1372,7 +1372,9 @@ class TernModelReader:
     # ── Packed loading ──────────────────────────────────────────
 
     def load_packed_model(
-        self, model: nn.Module
+        self,
+        model: nn.Module,
+        key_mapping: Optional[Dict[str, str]] = None,
     ) -> Tuple[list[str], list[str]]:
         """
         Load .tern-model weights as PackedTernaryLinear layers.
@@ -1397,6 +1399,21 @@ class TernModelReader:
 
         Args:
             model: PyTorch model to modify in-place.
+            key_mapping: Optional prefix-rewrite map applied to manifest
+                entry names BEFORE parameter-path resolution. Use named
+                presets like ``GEMMA4_MULTIMODAL_TRANSFORMERS_5_5`` to
+                bridge transformers API drift between artefact pack-time
+                and load-time (e.g., a manifest packed against
+                pre-5.5 transformers can load against transformers 5.5+
+                models that moved language-model components under
+                ``model.language_model.*``). Mirrors the same parameter
+                on ``load_as_model`` for parity.
+
+                Permissive semantics: entry names that don't match any
+                source key in the mapping pass through unchanged.
+                Downstream ``_resolve_module_or_raise`` provides loud
+                failure if the (translated or untranslated) name doesn't
+                resolve on the model.
 
         Returns:
             (missing_keys, unexpected_keys) analogous to load_state_dict.
@@ -1418,8 +1435,17 @@ class TernModelReader:
         int4_load_logged = False
 
         for entry in self.manifest["layers"]:
-            name = entry["name"]
-            raw = self.read_layer_data(name)
+            raw_name = entry["name"]
+            # Apply key_mapping translation BEFORE parameter-path
+            # resolution. Mirrors the inline pattern from load_as_model
+            # (first match wins; names not in mapping pass through).
+            name = raw_name
+            if key_mapping:
+                for src, dst in key_mapping.items():
+                    if raw_name.startswith(src):
+                        name = dst + raw_name[len(src):]
+                        break
+            raw = self.read_layer_data(raw_name)
             buf = io.BytesIO(raw)
 
             # Detect parameter-path naming (production) vs module-path
@@ -1472,7 +1498,7 @@ class TernModelReader:
                 # is the entry name as-is (e.g. ``fc1``).
                 _replace_submodule_or_raise(
                     model, module_path, packed_layer,
-                    diagnostic_entry_name=name,
+                    diagnostic_entry_name=raw_name,
                 )
 
                 loaded_keys.append(f"{module_path}.packed_weights")
@@ -1509,7 +1535,7 @@ class TernModelReader:
                     # uniformly.
                     target_param = _resolve_parameter_or_raise(
                         model, module_path, param_name,
-                        diagnostic_entry_name=name,
+                        diagnostic_entry_name=raw_name,
                     )
                     target_param.data = tensors["weight"]
                     loaded_keys.append(name)
@@ -1553,7 +1579,7 @@ class TernModelReader:
                     # FP16 branch — walk to the parameter, set its .data.
                     target_param = _resolve_parameter_or_raise(
                         model, module_path, param_name,
-                        diagnostic_entry_name=name,
+                        diagnostic_entry_name=raw_name,
                     )
                     target_param.data = tensors["weight"]
                     loaded_keys.append(name)

@@ -436,3 +436,171 @@ def test_int4_entries_with_parameter_path_naming_load_correctly(
     token_ids = torch.tensor([[0, 1, 2]], dtype=torch.long)
     output = model(token_ids)
     assert not torch.isnan(output).any(), "Forward pass produced NaN output"
+
+
+# ── key_mapping translation tests ─────────────────────────────────────
+
+
+class WrappedTinyModel(nn.Module):
+    """TinyModel wrapped in a parent module to exercise prefix translation.
+
+    Manifest written with ``embedding.weight`` etc. (no parent prefix);
+    model loaded against ``inner.embedding.weight`` etc. (parent prefix).
+    The key_mapping translates between the two.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.inner = TinyModel()
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.inner(token_ids)
+
+
+def test_key_mapping_default_none_preserves_existing_behaviour(tmp_path: Path):
+    """Identity mapping (default ``None``): all 3 prior tests still pass.
+
+    Smoke check that adding the parameter doesn't change the default
+    code path. Just re-runs the FP16 fixture against an unprefixed
+    TinyModel — should load identically.
+    """
+    torch.manual_seed(42)
+    model = TinyModel()
+    sentinel_norm = torch.full((4,), 7.0)
+
+    out_path = tmp_path / "fp16_only.tern-model"
+    _build_fp16_only_manifest(
+        out_path,
+        sentinel_norm_weight=sentinel_norm,
+        sentinel_norm_bias=torch.full((4,), -3.0),
+        sentinel_embedding_weight=torch.full((8, 4), 5.0),
+        sentinel_linear1_bias=torch.full((6,), 11.0),
+    )
+
+    reader = TernModelReader(str(out_path))
+    # No key_mapping argument — should match Commit 2 + 3 behaviour.
+    reader.load_packed_model(model)
+    assert torch.allclose(model.norm.weight.data, sentinel_norm)
+
+
+def test_key_mapping_translates_prefix(tmp_path: Path):
+    """Custom dict prefix translation lands manifest entries on prefixed
+    model paths.
+
+    Manifest entry ``embedding.weight`` translates to
+    ``inner.embedding.weight`` for loading against ``WrappedTinyModel``.
+    """
+    torch.manual_seed(42)
+    model = WrappedTinyModel()
+    sentinel_norm = torch.full((4,), 7.0)
+
+    out_path = tmp_path / "fp16_only.tern-model"
+    _build_fp16_only_manifest(
+        out_path,
+        sentinel_norm_weight=sentinel_norm,
+        sentinel_norm_bias=torch.full((4,), -3.0),
+        sentinel_embedding_weight=torch.full((8, 4), 5.0),
+        sentinel_linear1_bias=torch.full((6,), 11.0),
+    )
+
+    reader = TernModelReader(str(out_path))
+    # Translate every manifest entry's prefix to "inner.<original>".
+    # Mapping the empty prefix would be ambiguous; instead map the four
+    # known top-level prefixes used in the fixture.
+    key_mapping = {
+        "embedding.": "inner.embedding.",
+        "norm.": "inner.norm.",
+        "linear1.": "inner.linear1.",
+        "linear2.": "inner.linear2.",
+    }
+    reader.load_packed_model(model, key_mapping=key_mapping)
+
+    # Translated entries land on the wrapped model's inner parameters.
+    assert torch.allclose(model.inner.norm.weight.data, sentinel_norm), (
+        "Translated norm.weight → inner.norm.weight should land at "
+        "model.inner.norm.weight via key_mapping translation."
+    )
+
+
+def test_key_mapping_unmapped_names_pass_through(tmp_path: Path):
+    """Permissive semantics: names not matching any source key in the
+    mapping pass through unchanged.
+
+    Mapping covers only ``norm.``; other entries (``embedding.weight``,
+    ``linear1.bias``) pass through unchanged and load against the
+    unprefixed TinyModel directly.
+    """
+    torch.manual_seed(42)
+    model = TinyModel()
+    sentinel_norm = torch.full((4,), 7.0)
+    sentinel_embed = torch.full((8, 4), 5.0)
+
+    out_path = tmp_path / "fp16_only.tern-model"
+    _build_fp16_only_manifest(
+        out_path,
+        sentinel_norm_weight=sentinel_norm,
+        sentinel_norm_bias=torch.full((4,), -3.0),
+        sentinel_embedding_weight=sentinel_embed,
+        sentinel_linear1_bias=torch.full((6,), 11.0),
+    )
+
+    reader = TernModelReader(str(out_path))
+    # Mapping covers only "norm."; identity for everything else.
+    # Map norm. to itself so the entry resolves cleanly; the other
+    # entries (embedding, linear1) pass through with no mapping and
+    # land at their original paths.
+    key_mapping = {"norm.": "norm."}
+    reader.load_packed_model(model, key_mapping=key_mapping)
+
+    # Pass-through entries land at original paths.
+    assert torch.allclose(model.embedding.weight.data, sentinel_embed), (
+        "embedding.weight not in mapping; should pass through unchanged "
+        "and load at model.embedding.weight."
+    )
+    assert torch.allclose(model.norm.weight.data, sentinel_norm), (
+        "norm. mapping (identity) should leave norm.weight unchanged."
+    )
+
+
+def test_key_mapping_unresolvable_post_translation_name_raises(
+    tmp_path: Path,
+):
+    """Loud failure: post-translation name doesn't resolve on the model.
+
+    Mapping translates ``norm.`` to a path that doesn't exist on the
+    model. ``_resolve_module_or_raise`` raises ValueError naming the
+    manifest entry and the missing path component.
+    """
+    torch.manual_seed(42)
+    model = TinyModel()
+
+    out_path = tmp_path / "fp16_only.tern-model"
+    _build_fp16_only_manifest(
+        out_path,
+        sentinel_norm_weight=torch.full((4,), 7.0),
+        sentinel_norm_bias=torch.full((4,), -3.0),
+        sentinel_embedding_weight=torch.full((8, 4), 5.0),
+        sentinel_linear1_bias=torch.full((6,), 11.0),
+    )
+
+    reader = TernModelReader(str(out_path))
+    # Translate norm. → nonexistent_module. — model has no such module.
+    key_mapping = {"norm.": "nonexistent_module."}
+
+    with pytest.raises(ValueError) as exc_info:
+        reader.load_packed_model(model, key_mapping=key_mapping)
+
+    msg = str(exc_info.value)
+    # Error message should reference the original manifest entry name
+    # (not the translated form) so users can trace back to the on-disk
+    # manifest.
+    assert "norm.weight" in msg, (
+        f"ValueError should reference original manifest entry 'norm.weight'; "
+        f"actual message: {msg}"
+    )
+    # Error message should also reference the unresolvable path
+    # component so diagnosis points at the missing module.
+    assert "nonexistent_module" in msg, (
+        f"ValueError should reference the unresolvable translated "
+        f"component; actual message: {msg}"
+    )
