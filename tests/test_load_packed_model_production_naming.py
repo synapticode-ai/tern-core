@@ -134,6 +134,39 @@ def _build_fp16_only_manifest(
     return 4
 
 
+def _build_int4_included_manifest(
+    out_path: Path,
+    *,
+    linear1_weight: torch.Tensor,
+) -> int:
+    """Manifest with one INT4 entry — isolates the INT4 dispatch fix.
+
+    Single ``linear1.weight`` entry as INT4 (block_size=32). Other
+    entries omitted to keep the fixture minimal — the test asserts the
+    INT4 entry loads and the dequantised tensor lands on the target
+    parameter within INT4 quantisation tolerance.
+
+    Returns the count of manifest entries written.
+    """
+    from terncore.int4_quantizer import quantize_int4_block
+
+    writer = TernModelWriter({"source": "synthetic-fixture-int4-included"})
+
+    result = quantize_int4_block(linear1_weight, block_size=32)
+    writer.add_int4_layer(
+        name="linear1.weight",
+        packed_weights=result.packed_weights,
+        scales=result.scales,
+        shape=result.weight_shape,
+        scale_shape=result.scale_shape,
+        block_size=result.block_size,
+        quant_error=result.reconstruction_error,
+    )
+
+    writer.write(out_path)
+    return 1
+
+
 def _build_ternary_included_manifest(
     out_path: Path,
     *,
@@ -330,3 +363,76 @@ def test_ternary_entries_with_parameter_path_naming_load_without_typeerror(
     assert output.shape == (1, 3, 4), (
         f"Output shape {output.shape} unexpected (model defines 4-dim output)"
     )
+
+
+def test_int4_entries_with_parameter_path_naming_load_correctly(
+    tmp_path: Path, caplog,
+):
+    """Reproduces backlog item bug 3: INT4 dispatch missing in load_packed_model.
+
+    The pre-Commit-3 ``load_packed_model`` if-elif chain only handled
+    ``ternary2`` and ``float16`` — INT4 entries (``int4_block32`` dtype)
+    fell off the dispatch and were silently dropped. 11 INT4 entries
+    silently dropped on gemopus-4-e4b; 10 on Wednesday's 26B-A4B
+    compression via cross-applied E4B sensitivity map.
+
+    Test asserts the EXPECTED post-fix behaviour:
+    - INT4 entry loads via parameter-path-aware traversal
+    - The dequantised FP32 tensor lands on ``linear1.weight``
+    - Within INT4 block-wise quantisation reconstruction tolerance
+    - The operator-visible INFO log message about B.1 dequantisation
+      trade-off fires (one-shot per load call)
+    - Forward pass works
+
+    Currently FAILS pre-Commit-3 (INT4 dispatch missing). Will pass
+    once Commit 3 lands the INT4 branch.
+    """
+    import logging
+
+    torch.manual_seed(42)
+    model = TinyModel()
+
+    # Use a known weight that we can compare against post-load. The
+    # tolerance band reflects INT4 block-wise quantisation reconstruction
+    # error: empirically ~1-3% relative error on typical transformer
+    # weight distributions. Synthetic random tensor here gets a slightly
+    # generous tolerance.
+    linear1_weight = torch.randn(6, 4)
+
+    out_path = tmp_path / "int4_included.tern-model"
+    _build_int4_included_manifest(
+        out_path,
+        linear1_weight=linear1_weight,
+    )
+
+    reader = TernModelReader(str(out_path))
+
+    caplog.set_level(logging.INFO, logger="terncore.tern_model")
+    reader.load_packed_model(model)
+
+    # Operator-visible log message: B.1 trade-off surfaced
+    int4_log_records = [
+        r for r in caplog.records
+        if "INT4" in r.message and "dequantise-to-FP32" in r.message
+    ]
+    assert len(int4_log_records) == 1, (
+        f"Expected exactly one INT4 dequantisation log message; "
+        f"got {len(int4_log_records)}. All log records: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+    # The dequantised FP32 tensor lands on linear1.weight.
+    # INT4 reconstruction tolerance: within typical block-wise quantisation
+    # reconstruction error band. Generous bounds for synthetic random tensor.
+    assert torch.allclose(
+        model.linear1.weight.data, linear1_weight, atol=0.15, rtol=0.15
+    ), (
+        f"linear1.weight does not match the original (within INT4 "
+        f"tolerance). Max abs diff: "
+        f"{(model.linear1.weight.data - linear1_weight).abs().max().item()}"
+    )
+
+    # Forward pass works (smoke check). NaN-free output.
+    token_ids = torch.tensor([[0, 1, 2]], dtype=torch.long)
+    output = model(token_ids)
+    assert not torch.isnan(output).any(), "Forward pass produced NaN output"

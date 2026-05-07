@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import struct
 import time
 import zlib
@@ -30,6 +31,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from terncore.arithmetic.quantizer import TernaryQuantizer
 from terncore.sparse import pack_ternary_weights, unpack_ternary_weights
+
+logger = logging.getLogger(__name__)
 
 # Format constants
 TERN_MAGIC = b"TERN"
@@ -1379,6 +1382,19 @@ class TernModelReader:
 
         For FP16 layers: load as regular nn.Linear weights.
 
+        For INT4 (``int4_block32``) layers: dequantise via
+        ``_reconstruct_int4`` and assign the FP32 result to the target
+        parameter via the parameter-path-aware traversal. **B.1 trade-off**:
+        runtime memory footprint for INT4 entries matches FP32, not INT4.
+        Production exposure is small (~20 INT4 entries across all 5
+        manifests, all cross-applied sensitivity-map fallbacks for
+        high-error layers). The runtime-memory-preserved variant
+        (PackedINT4Linear, B.2) is banked as a low-priority backlog item
+        for future work when commercial pressure justifies the
+        implementation cost. An INFO-level log message at first INT4
+        entry encountered surfaces this trade-off explicitly so
+        operators see it in load output.
+
         Args:
             model: PyTorch model to modify in-place.
 
@@ -1390,6 +1406,16 @@ class TernModelReader:
         loaded_keys: list[str] = []
         model_keys = set(dict(model.named_parameters()).keys())
         model_keys.update(dict(model.named_buffers()).keys())
+
+        # Per-call counter for INT4 entries — drives the operator-visible
+        # log message (one-shot per load_packed_model invocation, not a
+        # process-global flag, so multiple loads in one session each
+        # surface the trade-off independently).
+        int4_count = sum(
+            1 for entry in self.manifest["layers"]
+            if entry.get("dtype") == "int4_block32"
+        )
+        int4_load_logged = False
 
         for entry in self.manifest["layers"]:
             name = entry["name"]
@@ -1481,6 +1507,50 @@ class TernModelReader:
                     # arbitrary module-level Parameters (layer_scalar,
                     # per_expert_scale, calibration tensors, etc.)
                     # uniformly.
+                    target_param = _resolve_parameter_or_raise(
+                        model, module_path, param_name,
+                        diagnostic_entry_name=name,
+                    )
+                    target_param.data = tensors["weight"]
+                    loaded_keys.append(name)
+
+            elif entry["dtype"] == "int4_block32":
+                # B.1 design: dequantise INT4 to FP32 at load, assign to
+                # target parameter. Runtime memory footprint matches FP32
+                # rather than INT4. Production exposure small (~20 entries
+                # across all manifests). PackedINT4Linear (B.2) banked as
+                # backlog item for future commercial-driven implementation.
+                if not int4_load_logged:
+                    logger.info(
+                        "Loading %d INT4 entries via dequantise-to-FP32 path. "
+                        "Runtime memory footprint for these entries matches "
+                        "FP32, not INT4. Banked optimisation: PackedINT4Linear "
+                        "for runtime-memory-preserved INT4 inference "
+                        "(cf. docs/backlog.md).",
+                        int4_count,
+                    )
+                    int4_load_logged = True
+
+                tensors = self._reconstruct_int4(buf, entry)
+
+                if param_name is None:
+                    # Module-path naming (test convention): no production
+                    # manifests currently exercise this path for INT4, but
+                    # preserve symmetry with FP16 branch.
+                    parts = module_path.split(".")
+                    parent = model
+                    for part in parts[:-1]:
+                        parent = getattr(parent, part)
+                    module = getattr(parent, parts[-1])
+                    if isinstance(module, nn.Linear):
+                        module.weight.data = tensors["weight"]
+                        loaded_keys.append(f"{module_path}.weight")
+                        if "bias" in tensors and module.bias is not None:
+                            module.bias.data = tensors["bias"]
+                            loaded_keys.append(f"{module_path}.bias")
+                else:
+                    # Parameter-path naming (production): same path as
+                    # FP16 branch — walk to the parameter, set its .data.
                     target_param = _resolve_parameter_or_raise(
                         model, module_path, param_name,
                         diagnostic_entry_name=name,

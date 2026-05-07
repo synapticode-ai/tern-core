@@ -69,6 +69,18 @@ convention untested until Phase 2.
 
 ---
 
+### Implement PackedINT4Linear for runtime-memory-preserved INT4 inference
+
+**Status:** Open (low priority, future-when-needed)
+**Surfaced:** 2026-05-07 Thursday evening rewrite Commit 3 design
+**Observation:** `load_packed_model`'s Commit 3 INT4 branch dequantises INT4 entries to FP32 at load time (Scenario B.1 trade-off). Production exposure is small (~20 INT4 entries across all 5 manifests, mostly cross-applied sensitivity-map fallbacks for high-error layers; gemopus-4-e4b has 11, Wednesday's 26B-A4B compression has 10). Runtime memory difference vs a packed runtime module is probably <100 MB across the entire dataset. INFO-level log message at first INT4 entry encountered surfaces this trade-off explicitly so operators see it in load output (cf. `tern_model.py:load_packed_model` docstring).
+
+**Resolution scope:** Implement `PackedINT4Linear` mirroring `PackedTernaryLinear`'s structure — holds packed INT4 weights + per-block scales, dequantises on forward (or implements INT4 matmul via Metal kernel for runtime-memory-preserved inference). ~2-3 hours focused engineering plus tests plus integration into `load_packed_model`.
+
+**Trigger for unblocking:** commercial pressure that justifies the runtime-memory-preserved variant (e.g., a partner deployment where the INT4 entries dominate or the FP32 dequantisation cost matters at inference scale).
+
+---
+
 ### Llama-3.1-70B-Instruct source weights: download deferred
 
 **Status:** Open (low priority, future-when-needed)
