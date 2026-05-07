@@ -10,30 +10,21 @@ fix scope. Closed items move to a "Closed" section at the bottom.
 
 ### load_packed_model rewrite — production manifest support
 
-**Surfaced:** 2026-05-03 Phase 2 Stage C round-trip on production
-gemopus-4-e4b artefact. Three issues identified:
+**Surfaced:** 2026-05-03 Phase 2 Stage C round-trip on production gemopus-4-e4b artefact (FP16 silent skip). **Scope expanded 2026-05-07** during Commit 1 design probe — discovered the ternary path has the same parameter-path traversal flaw, manifesting as silent module-structure corruption rather than silent skipping.
 
-1. **FP16 branch handles only module-path manifest naming**
-   (`tern_model.py:1111-1124`). Test convention writes
-   `add_layer("fc1", ...)` → manifest name `"fc1"`, and the loader walks
-   `parts[:-1]` then `getattr(parent, parts[-1])` expecting a Linear
-   submodule. Production `convert.py` writes parameter-path naming
-   (`<module>.weight`, `<module>.bias`); the same loader code fetches
-   `getattr(linear, "weight")` (a Parameter object) and
-   `isinstance(Parameter, nn.Linear)` returns False, silently skipping
-   853 of 2130 entries on gemopus-4-e4b (852 `.weight` + 1 `.bias`).
+**Bugs surfaced for fix (shared root cause: parameter-path naming not detected):**
 
-2. **`int4_block32` dtype not handled in `load_packed_model`.**
-   `reconstruct_layer` handles it via `_reconstruct_int4`
-   (`tern_model.py:847-848`), but `load_packed_model` has only
-   `ternary2` + `float16` branches. 11 entries silently skipped on
-   gemopus-4-e4b.
+1. **FP16 silent skip** (originally documented). Parameter-path manifest naming (e.g., `model.layers.0.norm.weight`) walks `parts[:-1]` to the parent module; `getattr(parent, "weight")` returns a Parameter, not an `nn.Linear`; `isinstance(Parameter, nn.Linear)` is False; entry silently skipped. **853 of 2130 entries lost on gemopus-4-e4b** (852 `.weight` + 1 `.bias`). Affects every FP16 entry whose target is a non-Linear module (LayerNorm, RMSNorm, Embedding) or whose name uses parameter-path convention.
 
-3. **`key_mapping` translation needed for transformers API drift.**
-   Already shipped as parameter on `load_as_model` (2026-05-03);
-   `load_packed_model` needs the same parameter for parity. Preset
-   `GEMMA4_MULTIMODAL_TRANSFORMERS_5_5` already defined at module
-   scope in `tern_model.py`.
+2. **Ternary silent corruption** (surfaced 2026-05-07 during Commit 1 design probe). Same parameter-path traversal: ternary entry `model.layers.0.q_proj.weight` walks to `model.layers.0.q_proj` (the Linear), then `setattr(q_proj, "weight", PackedTernaryLinear_instance)` — **replaces the `weight` Parameter with a Module instance**. Model loads "successfully" with no errors; corruption surfaces at first forward pass as a confusing `__matmul__` / type error. Affects every ternary entry on production manifests (~1,277 on gemopus-4-e4b). More dangerous than FP16 silent skip because failure is delayed and confusing rather than visible at load time.
+
+3. **`int4_block32` dtype not handled in `load_packed_model`.** `reconstruct_layer` handles it via `_reconstruct_int4` (`tern_model.py:847-848`), but `load_packed_model` has only `ternary2` + `float16` branches. 11 entries silently skipped on gemopus-4-e4b. INT4 routing also occurred on Wednesday's 26B-A4B compression (10 entries via cross-applied E4B sensitivity map), so this affects production manifests beyond gemopus-4-e4b.
+
+4. **`key_mapping` translation needed for transformers API drift.** Already shipped as parameter on `load_as_model` (2026-05-03); `load_packed_model` needs the same parameter for parity. Preset `GEMMA4_MULTIMODAL_TRANSFORMERS_5_5` already defined at module scope in `tern_model.py`.
+
+5. **`missing`/`unexpected` reporting is also broken.** Discovered during Commit 1 design probe: the function returns `(missing, unexpected)` analogous to `load_state_dict`, but `loaded_keys.append(f"{name}.weight")` for FP16 entries with parameter-path naming produces double-suffixed entries (`"embedding.weight.weight"`). Comparison against `model.named_parameters()` keys is therefore unreliable. Fix needs to produce correct loaded_keys for parameter-path entries (just `name`, not `f"{name}.weight"` when name already ends in `.weight`).
+
+The first two bugs share the same root cause: load path doesn't detect when manifest entry names use parameter-path naming (suffixed with `.weight` / `.bias`) versus module-path naming (bare module identifier, test convention). Fix requires uniform parameter-path-aware traversal in both ternary and FP16 branches.
 
 **Test gap:** `tests/test_packed_linear.py` exercises module-path naming
 only. `tests/test_sparsity.py:148-171` likewise. Production naming
