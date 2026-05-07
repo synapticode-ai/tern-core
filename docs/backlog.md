@@ -85,6 +85,28 @@ convention untested until Phase 2.
 
 ---
 
+### Additive compression methodology investigation
+
+**Status:** Open (medium priority, follow-up research)
+**Surfaced:** 2026-05-07 by Rob during Session Thursday close-out
+**Observation:** Today's cross-architecture finding establishes per-expert ternary as a 4.1-4.9× compression baseline across architectures. tern-core already integrates two additive techniques: (1) **TurboQuant** (ICLR 2026, KV cache compression, 6× memory) live at `tools/tern_infer.py:149+` with combined-stack benchmark documented in `README.md` (Mistral-7B at ~3.5 GB total Apple Silicon footprint), and (2) **mixed ternary/INT4** (v0.6.0) routing high-error layers to INT4 via sensitivity scan. Rob references prior March 2026 KV cache comparative benchmarking work (per-model variation: TurboQuant outperformed alternatives for some models, alternatives outperformed for others) plus an earlier ~300B model compression attempt that didn't fit 64 GB. **Neither is in CC's visible context** — auto-memory file system effectively begins 1 May 2026; March work pre-dates it. Investigation reconstructs Rob's recollection via manual prompts rather than CC pattern-matching from incomplete traces.
+
+**Investigation scope:**
+- **Reconstruct prior history with Rob** via manual prompts: which specific models were benchmarked in March, which KV cache compression alternatives were tested — Rob's recollection should drive this; published candidates worth considering as starting points include KIVI, KVQuant, GEAR, H2O, AlphaCompress, but the actual March-tested set may have been different. Which ~300B-class model attempt was tried (possibly Llama 3.1 405B misremembered, possibly Falcon-180B, possibly a proprietary attempt) and what compression stack was applied.
+- **Per-model recommendation matrix**: build a small matrix of (model class, KV compression technique, quality preserved, memory saved) so Apple/KAIST/NPU partners can answer "which technique on which model?" without re-running the comparison
+- **Inventory additive methodologies** beyond what tern-core already integrates (activation quantisation, structured pruning, layer-wise mixed precision per-expert, sparse attention, knowledge distillation, others)
+- **Compose with current per-expert ternary baseline**: which techniques stack cleanly (TurboQuant already proven), which conflict, which require infrastructure work
+- **Re-examine TurboQuant default for new model classes** (Qwen3 MoE, Phi-4, future MiniMax) — March benchmarking may not generalise to architectures that didn't exist then
+- **Estimate additional compression headroom** when measurable; note where mechanistic assumptions outrun current static-weight measurement (per Thursday's MoE structural-sparsity hedging in the briefing scaffold)
+
+**Memory coverage gap noted:** auto-memory file system at `~/.claude/projects/-Users-syn/memory/` effectively begins 2026-05-01. Pre-May work (including March KV cache benchmarking + the ~300B attempt) lives in earlier conversation context that wasn't persisted. Future sessions should not assume CC has reliable recall of pre-May work without verifying against actual memory traces.
+
+**Resolution scope:** Dedicated session (~2-3 hours) when current sprint cluster work concludes. Could also be triggered earlier if a specific commercial conversation (Apple ANE/CoreML partnership, KAIST/KSGC engagement) creates pressure for tighter compression than today's baseline.
+
+**Why this matters commercially:** Today's 4.9× best ratio means a 60B-class MoE compresses to ~24 GB on M4 Pro 64 GB. If additive methodologies push the on-disk ratio to 6-8×, the unified-memory deployment ceiling rises from 60B-class to 80-120B-class models. Combined with TurboQuant's KV cache reduction (already proven 6× on small models), the total system footprint shrinks proportionally for inference workloads. The per-model recommendation matrix is itself commercially valuable — partners can scope deployments to specific model classes without exploratory benchmarking on their side.
+
+---
+
 ## Closed
 
 ### reconstruct_all suffix-doubling — production manifest support
