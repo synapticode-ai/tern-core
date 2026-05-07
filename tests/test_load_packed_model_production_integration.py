@@ -47,6 +47,7 @@ IN_SCOPE_MANIFESTS = [
         "microsoft/phi-4",
         "The capital of France is",
         240,  # actual: 243 entries (160 ternary + 83 FP16)
+        None,  # key_mapping: identity (Phi-4 names match HF model directly)
         id="phi-4",
     ),
     pytest.param(
@@ -56,6 +57,14 @@ IN_SCOPE_MANIFESTS = [
         "google/gemma-4-26b-a4b-it",
         "The capital of France is",
         8600,  # actual: 8633 entries (7875 ternary + 748 FP16 + 10 INT4)
+        # key_mapping: bridge transformers 5.5+ multimodal layout. Manifest
+        # was packed via Gemma4Adapter.normalize_name() which strips
+        # ``language_model.`` prefix; HF AutoModelForCausalLM loads the
+        # full layout with the prefix in place. Without the key_mapping,
+        # _resolve_module_or_raise fires (correctly) on the first
+        # ``model.embed_tokens.weight`` entry which does not exist on the
+        # multimodal model (which has ``model.language_model.embed_tokens.weight``).
+        "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5",  # resolved at test time to the actual dict
         id="gemma4-26b-a4b",
     ),
 ]
@@ -126,7 +135,8 @@ def _smoke_probe(model, tokenizer, prompt: str, max_new_tokens: int = 50):
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    "label,manifest_path,hf_model_id,smoke_prompt,expected_min_entries",
+    "label,manifest_path,hf_model_id,smoke_prompt,expected_min_entries,"
+    "key_mapping_name",
     IN_SCOPE_MANIFESTS,
 )
 def test_load_packed_model_production_integration(
@@ -135,6 +145,7 @@ def test_load_packed_model_production_integration(
     hf_model_id: str,
     smoke_prompt: str,
     expected_min_entries: int,
+    key_mapping_name: Optional[str],
     capsys,
 ):
     """Integration test: load_packed_model on real production manifest + smoke probe.
@@ -152,6 +163,7 @@ def test_load_packed_model_production_integration(
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    from terncore import tern_model as _tern_model_module
     from terncore.tern_model import TernModelReader
 
     if not Path(manifest_path).exists():
@@ -159,6 +171,16 @@ def test_load_packed_model_production_integration(
             f"Manifest path not on disk: {manifest_path}. "
             f"Syn Archive may not be mounted on this host."
         )
+
+    # Resolve named key_mapping preset (e.g. ``GEMMA4_MULTIMODAL_TRANSFORMERS_5_5``)
+    # at test time so the parametrise list stays simple strings rather than
+    # evaluating module-level constants at import time. ``None`` skips
+    # translation (identity mapping).
+    key_mapping = (
+        getattr(_tern_model_module, key_mapping_name)
+        if key_mapping_name is not None
+        else None
+    )
 
     reader = TernModelReader(manifest_path)
     n_manifest_entries = len(reader.manifest["layers"])
@@ -197,8 +219,10 @@ def test_load_packed_model_production_integration(
         flush=True,
     )
 
-    # Apply rewritten load_packed_model.
-    missing, unexpected = reader.load_packed_model(model)
+    # Apply rewritten load_packed_model. Pass key_mapping (None for
+    # identity, dict for transformers API drift presets like
+    # GEMMA4_MULTIMODAL_TRANSFORMERS_5_5).
+    missing, unexpected = reader.load_packed_model(model, key_mapping=key_mapping)
 
     # The (missing, unexpected) reporting is informational; the rewrite's
     # acceptance criterion is "load succeeds without exceptions" (covered
