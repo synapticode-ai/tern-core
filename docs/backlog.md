@@ -8,10 +8,17 @@ fix scope. Closed items move to a "Closed" section at the bottom.
 
 ## Open
 
-### load_packed_model rewrite — production manifest support
+### load_packed_model rewrite — ELEVATED to HIGH priority (commercial-gating, Friday's first deliverable)
 
-**Surfaced:** 2026-05-03 Phase 2 Stage C round-trip on production
-gemopus-4-e4b artefact. Three issues identified:
+**Status:** Open (HIGH priority — gating Friday 2026-05-08's additive compression investigation)
+**Original surfacing:** 2026-05-03 Phase 2 Stage C round-trip on production gemopus-4-e4b artefact (deferred technical debt)
+**Elevation surfacing:** 2026-05-07 Thursday evening preparation for additive compression investigation surfaced infrastructure gap
+
+**Why this is now commercial-gating:** Thursday evening's preparation work for the additive compression investigation (cf. `docs/TN-003_additive_compression_landscape.md`) revealed that the existing TurboQuant integration at `tools/tern_infer.py:149+` operates on the v0.1.0 path (HuggingFace `AutoModelForCausalLM` + on-the-fly `MixedPrecisionConverter`), NOT on the per-expert sliced `.tern-model` artefacts produced by PR #14-#17. The infrastructure to measure ANY KV cache compression technique (TurboQuant baseline against today's manifests, KIVI, KVQuant, kvtc) requires the `.tern-model` inference path to load production artefacts correctly first.
+
+Every Apple/KAIST/NPU partner conversation about additive compression numbers is gated on this rewrite. The cross-architecture finding established Thursday morning lives in the `.tern-model` artefacts; the additive compression story needs to extend that finding, which requires inference against those same artefacts.
+
+Three issues identified during 2026-05-03 Phase 2 Stage C round-trip:
 
 1. **FP16 branch handles only module-path manifest naming**
    (`tern_model.py:1111-1124`). Test convention writes
@@ -53,7 +60,13 @@ convention untested until Phase 2.
   every entry lands at its correct destination, with diffs against
   `from_pretrained` weights for a small reference model.
 
-**Estimated effort:** 4–6 hours focused work with PR.
+**Estimated effort:** 4–6 hours focused work with PR. Friday morning's first substantial deliverable per `docs/TN-003_additive_compression_landscape.md` Friday investigation plan section.
+
+**Friday acceptance criteria:**
+- All 5 compressed manifests on disk (Mistral-7B, gemma4-26b-a4b, gemma4-31b, qwen3-30b-a3b, phi-4) load via `load_packed_model` without silent entry skipping
+- Loaded models produce non-garbage outputs on a 10K-token smoke probe per model
+- `key_mapping` parameter accepts `GEMMA4_MULTIMODAL_TRANSFORMERS_5_5` and other future drift presets
+- Test coverage added in `tests/test_packed_linear.py` (or sibling) exercising production-naming-convention manifests
 
 ---
 
