@@ -228,11 +228,24 @@ Per the elevated backlog item, this gated everything downstream. Landed via PR #
 - load_packed_model: MoE per-expert restacking for stacked-tensor architectures (natural integration with L5 sprint week of 2026-05-12)
 - 9th probe-before-committing instance banked to methodology memory (validation infrastructure scope extension)
 
-### Friday late morning (1-2 hours): Build measurement infrastructure
+### Friday late morning (executed 2026-05-08 post-probes A + B): Build measurement infrastructure — re-scoped per probe findings
 
-1. **Perplexity harness on WikiText-2**: callable API `compute_perplexity(model, dataset_name="wikitext-2-raw-v1", split="validation")`. Currently PPL is internal to `MixedPrecisionConverter`'s auto-scan; expose as standalone utility.
-2. **TurboQuant adapter** from new `.tern-model` inference path to `IncrementalTQCompressor`. Depends on `past_key_values` shape compatibility post-rewrite.
-3. **Smoke test infrastructure on smallest model (Mistral-7B)**: verify TurboQuant compression reduces KV cache size as expected, perplexity stays within reasonable band of baseline.
+Two probes against the actual codebase before harness implementation surfaced that the original 3-item decomposition was structurally simpler than anticipated. Re-scoped decomposition below.
+
+**Probe findings summary:**
+
+- **Probe A (perplexity computation surface)**: `_measure_perplexity` lives at `src/terncore/autoscan.py:146-154` (NOT inside `MixedPrecisionConverter` as the original section anticipated). Function body is 6 lines: tokenise hardcoded `_CALIBRATION_TEXT` paragraph (autoscan.py:52) → forward pass with labels → exp(loss). Extraction is trivial; the substantive work is what's MISSING — WikiText-2 dataset loader (HF `datasets` library) + sliding-window PPL computation (standard for LLM benchmarking).
+- **Probe B (TurboQuant ↔ load_packed_model interface)**: `generate_streaming_turboquant(model, tokenizer, prompt, max_tokens)` at `tools/tern_infer.py:220+` is **agnostic to how the model was loaded**. It consumes pure HF model API (`outputs.past_key_values`); `_extract_kv_pairs` handles both legacy tuple format and new HF Cache object via isinstance. Whether the model came from `from_pretrained + MixedPrecisionConverter` (v0.1.0 path) or `from_pretrained + load_packed_model` (PR #18 path) is irrelevant. **No "adapter" code needed.** The work shifts from adapter-building to measurement-orchestration.
+
+**Re-scoped decomposition (3 items):**
+
+1. **WikiText-2 perplexity harness** (~1-1.5 hr): Extract `_measure_perplexity` body to standalone callable; add HF `datasets` library WikiText-2 loader (`wikitext-2-raw-v1`, validation split per landscape doc convention); add sliding-window PPL computation. Public API: `compute_perplexity(model, tokenizer, dataset_name="wikitext-2-raw-v1", split="validation", stride=512, max_length=2048) -> float`.
+2. **Measurement orchestration script** (~30-60 min): Wrapper that loads a `.tern-model` artefact via `load_packed_model`, runs `generate_streaming_turboquant`, collects metrics (perplexity via item 1; KV cache footprint via `IncrementalTQCompressor` API discovery at implementation time — likely `compressor.compressed[][]` traversal, but pending verification that introspection is straightforward attribute access rather than non-trivial traversal logic; peak RSS; wall-clock per token). Reports as a single JSON record per measurement run.
+3. **Smoke test on Phi-4** (~30 min): single end-to-end measurement against the in-scope Phi-4 `.tern-model` artefact. Per the size-diversity reality check in the Friday afternoon section, Phi-4 is the only `.tern-model` artefact in scope on M4 Pro 64 GB hardware. Verifies infrastructure works end-to-end before fanning out to KIVI/cluster-expansion work.
+
+**Net effort change**: ~2-2.5 hr (vs landscape doc's original 1-2 hr estimate). Larger than anticipated but redistributed — the perplexity harness is more substantive (dataset infra + sliding window), the adapter dissolves entirely.
+
+**Halt-and-surface trigger added**: implementation-time `IncrementalTQCompressor` API probe surfaces a structural surprise (e.g., size measurement requires non-trivial new code rather than simple attribute traversal) — surface and re-scope before proceeding.
 
 ### Friday afternoon (3-5 hours): Comparative measurements
 
