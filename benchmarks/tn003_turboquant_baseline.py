@@ -179,13 +179,19 @@ def _kv_cache_uncompressed_bytes_actual(
     obtained via ``model.dtype``). Bytes-per-element derived dynamically
     via ``torch.tensor([], dtype=dtype).element_size()`` to handle FP16 /
     BF16 / FP32 / FP64 / INT8 uniformly.
+
+    head_dim accessed via ``compressor.config.d`` — IncrementalTQCompressor's
+    constructor takes ``head_dim`` as a parameter and passes it to
+    TurboQuantConfig as ``d``, but does NOT store it as
+    ``self.head_dim`` (12th probe-before-committing instance, surfaced
+    2026-05-08 by smoke 1 v2 AttributeError after the cf73136 fix).
     """
     dtype_bytes = torch.tensor([], dtype=dtype).element_size()
     return (
         compressor.n_layers
         * compressor.n_heads
         * compressor.seq_len
-        * compressor.head_dim
+        * compressor.config.d
         * 2  # K + V
         * dtype_bytes
     )
