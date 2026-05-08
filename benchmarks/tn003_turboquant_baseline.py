@@ -116,7 +116,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _turboquant_compressed_bytes(tqc) -> int:
+def _turboquant_compressed_bytes(tqc, seen_ptrs: set) -> int:
     """Sum byte sizes of torch.Tensor fields on a TurboQuantCompressed.
 
     Traverses ``pq`` (PolarQuantCompressed) and ``qjl`` (QJLCompressed).
@@ -125,6 +125,17 @@ def _turboquant_compressed_bytes(tqc) -> int:
     (Codebook), which contain their own tensor state. Those nested
     tensors are typically shared across all positions in a layer×head
     and thus don't represent per-position storage cost.
+
+    ``seen_ptrs`` is a caller-supplied set of tensor storage pointers
+    (``tensor.data_ptr()``); each tensor counted exactly once across
+    the whole compressor traversal to deduplicate shared state (e.g.
+    ``qjl.S`` random projection matrix shared across all positions
+    within a layer×head — verified empirically 2026-05-08 when smoke 1
+    v3 produced a 121× INVERSE compression ratio because qjl.S was
+    counted per-instance across ~320,000 instances). data_ptr() used
+    rather than id() so tensors that view the same underlying storage
+    (tied embeddings, etc.) deduplicate correctly across PyTorch
+    versions.
 
     API discovered empirically 2026-05-08 after smoke 1 failed with
     ``AttributeError: 'TurboQuantCompressed' object has no attribute 'numel'``
@@ -138,6 +149,10 @@ def _turboquant_compressed_bytes(tqc) -> int:
         for field_name in component.__dataclass_fields__:
             value = getattr(component, field_name, None)
             if isinstance(value, torch.Tensor):
+                ptr = value.data_ptr()
+                if ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
                 total += value.numel() * value.element_size()
     return total
 
@@ -150,20 +165,50 @@ def _kv_cache_compressed_bytes_snapshot(
     Traverses the 3-level nested structure ``[layer][head][position_batch]``,
     where each leaf is a ``(k_c, v_c)`` tuple of ``TurboQuantCompressed``
     instances. Per-instance bytes computed via
-    ``_turboquant_compressed_bytes`` (direct dataclass tensor fields,
-    excluding shared nested objects).
+    ``_turboquant_compressed_bytes`` with a shared ``seen_ptrs`` set so
+    tensors with the same underlying storage are counted exactly once.
+
+    Deduplication catches ``qjl.S`` (random projection matrix, shared
+    across all positions in a layer×head) and any other shared state
+    regardless of which dataclass field exposes it.
 
     SNAPSHOT semantics: represents what TurboQuant would store under
-    its compression scheme. Under the existing open-loop pipeline, the
-    model's inference path uses the uncompressed ``past_key_values``
-    not this snapshot.
+    its compression scheme, deduplicated across shared tensors. Under
+    the existing open-loop pipeline, the model's inference path uses
+    the uncompressed ``past_key_values`` not this snapshot.
     """
+    seen_ptrs: set = set()
     total = 0
     for layer in compressor.compressed:
         for head in layer:
             for k_c, v_c in head:
-                total += _turboquant_compressed_bytes(k_c)
-                total += _turboquant_compressed_bytes(v_c)
+                total += _turboquant_compressed_bytes(k_c, seen_ptrs)
+                total += _turboquant_compressed_bytes(v_c, seen_ptrs)
+    return total
+
+
+def _model_param_count_via_state_dict(model) -> int:
+    """Total parameter count via state_dict (includes buffers, dedups tied weights).
+
+    Replaces ``sum(p.numel() for p in model.parameters())`` because
+    PackedTernaryLinear (post-load_packed_model) stores packed_weights
+    and scales as BUFFERS, not parameters; ``.parameters()`` misses
+    them — verified empirically 2026-05-08 when smoke 1 v3 reported
+    1.03B for Phi-4's 14B params, a 14× undercount.
+
+    ``state_dict()`` captures both parameters AND buffers. Dedup by
+    tensor storage pointer (``data_ptr()``) to handle tied embeddings
+    (e.g. LM head ↔ input embedding shared storage in HF models with
+    tied embeddings).
+    """
+    seen_ptrs: set = set()
+    total = 0
+    for t in model.state_dict().values():
+        ptr = t.data_ptr()
+        if ptr in seen_ptrs:
+            continue
+        seen_ptrs.add(ptr)
+        total += t.numel()
     return total
 
 
@@ -375,7 +420,7 @@ def main() -> int:
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "manifest": str(args.manifest),
         "hf_model_id": args.hf_model_id,
-        "model_param_count": sum(p.numel() for p in model.parameters()),
+        "model_param_count": _model_param_count_via_state_dict(model),
         "config": {
             "key_mapping": args.key_mapping,
             "prompt": args.prompt,
@@ -392,7 +437,11 @@ def main() -> int:
                 "(rotation/codebook nested objects excluded as typically "
                 "shared across positions in a layer×head). 'Hypothetical' "
                 "because the existing pipeline is open-loop — the snapshot "
-                "is not substituted back into the model's inference path."
+                "is not substituted back into the model's inference path. "
+                "Tensor instances deduplicated by storage pointer "
+                "(data_ptr()) — qjl.S random projection matrix is shared "
+                "across all positions within a layer×head and counted "
+                "exactly once."
             ),
         },
         "generation": {
