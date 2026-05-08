@@ -36,13 +36,19 @@ KIVI / KVQuant / kvtc / SpQt baseline scripts follow the same pattern
 at ``benchmarks/tn003_<technique>_baseline.py`` with the same JSON
 schema for apples-to-apples cross-technique comparison.
 
-Wall-clock estimate per Phi-4 measurement run:
+Wall-clock estimate per Phi-4 measurement run (empirical 2026-05-08):
 
-- HF base load: ~25 min cold / ~3-5 min cached
-- ``load_packed_model``: ~2-3 min
-- Generation (50 tokens): ~30s-2 min
-- Perplexity (default ON; ``--no-perplexity`` to skip): ~10-15 min
-- Total: ~30-45 min full / ~5-10 min ``--no-perplexity`` smoke
+- HF base load: ~27-29 min (HF cache lives on USB-C external storage —
+  read-throughput-bound; cold and "cached" loads have similar wall-clock
+  in practice, contrary to the original ~3-5 min cached estimate)
+- ``load_packed_model``: ~1 min (faster than originally estimated)
+- Generation (50 tokens): ~5 min on M4 Pro CPU
+- Perplexity (default ON; ``--no-perplexity`` to skip): TBD smoke 2;
+  estimated ~15-25 min for Phi-4 on WikiText-2 validation
+- Total ``--no-perplexity`` smoke: **~35 min** (verified across smoke 1
+  v1-v4) — substantially longer than the original ~5-10 min projection
+  because HF base load is read-throughput-bound on Syn Archive
+- Total full (with perplexity): TBD smoke 2; estimated ~50-60 min
 
 Copyright (c) 2025-2026 Gamma Seeds Pte Ltd. All rights reserved.
 """
@@ -420,7 +426,20 @@ def main() -> int:
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "manifest": str(args.manifest),
         "hf_model_id": args.hf_model_id,
-        "model_param_count": _model_param_count_via_state_dict(model),
+        "model_param_count": {
+            "value": _model_param_count_via_state_dict(model),
+            "scope_note": (
+                "Computed via state_dict() with data_ptr() dedup — captures "
+                "both Parameters and Buffers (PackedTernaryLinear stores "
+                "internal state as buffers post-load_packed_model). May "
+                "still undercount when the model uses bit-packed storage "
+                "(e.g. ternary trits packed 4-per-byte: numel() returns "
+                "byte count, not trit count). Empirical 2026-05-08 (smoke 1 "
+                "v4): Phi-4 14B reports 6.14B under this measurement — "
+                "~2.3× undercount factor depends on packing scheme of "
+                "compressed Linear layers."
+            ),
+        },
         "config": {
             "key_mapping": args.key_mapping,
             "prompt": args.prompt,
@@ -441,7 +460,18 @@ def main() -> int:
                 "Tensor instances deduplicated by storage pointer "
                 "(data_ptr()) — qjl.S random projection matrix is shared "
                 "across all positions within a layer×head and counted "
-                "exactly once."
+                "exactly once. Empirical finding 2026-05-08 (smoke 1 v4): "
+                "open-loop measurement at short context (~56 positions) "
+                "produces a ratio <1× because per-position state "
+                "(qjl.signs as int64, pq.indices, etc.) plus shared "
+                "rotation state (qjl.S) exceed FP16 uncompressed KV bytes "
+                "for that context length. TurboQuant's published 6× claim "
+                "is CLOSED-LOOP and depends on bit-level packing of signs "
+                "at storage time + reconstruction of decompressed state "
+                "on-the-fly — neither happens in the existing open-loop "
+                "pipeline. The ratio reported here is therefore the "
+                "open-loop upper bound, not TurboQuant's true compression "
+                "capability."
             ),
         },
         "generation": {

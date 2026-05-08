@@ -320,7 +320,46 @@ For Friday morning verification — CC has not fetched these in this session. Ea
 | Friday morning (2026-05-08): `load_packed_model` rewrite — infrastructure-critical | **Complete (PR #18 merged 10:18:57 AEST)** |
 | Friday early afternoon (executed): probes A + B (perplexity computation surface; TurboQuant `.tern-model` interface) — A: extraction trivial + dataset infra is the work; B: no adapter needed, pipeline is loader-agnostic | **Complete** |
 | Friday early afternoon: probe C (TurboQuant generation-loop integration scope) — open-loop pipeline finding; closed-loop integration banked separately | **Complete (10th probe-before-committing instance)** |
-| Friday afternoon: Measurement infrastructure build (perplexity harness extract; TurboQuant adapter) + first-target measurement (Phi-4) | Planned |
+| Friday afternoon: Measurement infrastructure build + smoke 1 v4 (Phi-4 --no-perplexity, open-loop baseline) | **Smoke 1 v4 complete (2026-05-08 15:58 AEST; ~35.7 min wall-clock; 0.29× open-loop ratio per scope finding); smoke 2 (with perplexity) next** |
 | Saturday/following: KIVI integration + cluster expansion (gemma4-26b-a4b post-MoE-restacking; hardware-unblocked 30B+ class) + KVQuant calibration + kvtc/SpQt paper identification | Planned |
 
 Updated incrementally as Friday's work lands. This document is the persistent reference scaffold.
+
+---
+
+## Empirical findings
+
+### Smoke 1 v4 — Phi-4 TurboQuant baseline (open-loop, no perplexity)
+
+**Date:** 2026-05-08 15:58 AEST
+**Manifest:** `phi4_14b_ternary_v0.1.1.tern-model` (7.17 GB on disk)
+**HF base:** `microsoft/phi-4`
+**Hardware:** M4 Pro 64 GB
+**Wall-clock total:** 35.7 min (HF base load 29.1 min + load_packed_model 1.1 min + generation 5.4 min + overhead)
+
+**Measurement results:**
+
+| Metric | Value | Notes |
+|---|---|---|
+| Manifest bytes on disk | 7.17 GB | weight compression artefact |
+| KV cache compressed snapshot | 72.7 MB | dedup'd via `data_ptr()` — `qjl.S` counted once per layer×head |
+| KV cache uncompressed actual | 21.1 MB | n_layers × n_heads × seq_len(56) × head_dim × 2(K+V) × 2(FP16) |
+| Hypothetical compression ratio | 0.29× | **OPEN-LOOP measurement** at short context — see interpretation below |
+| Generation tokens-per-second | 0.15 | Phi-4 14B FP16 on M4 Pro CPU; deterministic within 1% across 4 runs (v1-v4) |
+| TurboQuant compression op overhead | 5.55s for 50 tokens | ~111 ms per token |
+| Peak RSS | 35.9 GB | within M4 Pro 64 GB ceiling |
+| Generated text | "at at at at..." | Phi-4 quality envelope at threshold 0.7 (6th independent confirmation across PR #18 integration test, /tmp/phi4_disambiguation.py, smoke 1 v1/v2/v3/v4) |
+| Model param count via `state_dict` | 6.14B | undercounts Phi-4's 14B by ~2.3× (likely packed-storage byte count; see scope_note in JSON) |
+
+**Open-loop ratio interpretation (key finding):**
+
+The 0.29× ratio (compressed snapshot > uncompressed KV by ~3.4×) is empirically consistent with open-loop measurement of TurboQuant. TurboQuant's published 6× compression claim is **closed-loop** and depends on:
+
+1. Bit-level packing of signs at storage time (not the int64 dataclass storage that QJLCompressed exposes)
+2. Reconstruction of decompressed state on-the-fly during inference (not held in memory alongside uncompressed state)
+
+The existing pipeline is open-loop — compressed state is recorded but the model continues using uncompressed `past_key_values`. The ratio reported here is therefore the **open-loop upper bound**, NOT TurboQuant's true compression capability. Reproducibility of the closed-loop 6× ratio is gated on the "Close TurboQuant compress→decompress loop for true quality measurement" backlog item.
+
+**Determinism finding:** smoke 1 ran 4 times across 13:32-15:22 AEST. `load_packed_model` reported `missing=162, unexpected=320` bit-identical across all four runs. Generation produced identical output. Wall-clock variances within 1-9% (USB-C IO noise on Syn Archive). Banked as separate diagnostic backlog item ("load_packed_model missing/unexpected counts on Phi-4 dense — investigate root cause").
+
+**Probe-before-committing instance count:** 13 cumulative instances banked methodology-trail-wide; 4 added during Friday afternoon TN-003 work (instance 10 = probe C scope finding, instances 11/12/13 = orchestration script API surprises). Pattern earned its keep at every API surface; no 14th instance triggered the audit gate.

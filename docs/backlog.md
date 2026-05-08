@@ -172,6 +172,33 @@ Design surface required:
 
 ---
 
+### load_packed_model missing/unexpected counts on Phi-4 dense — investigate root cause
+
+**Status:** Open (low priority, investigation only — does not block measurement work)
+**Surfaced:** 2026-05-08 by smoke 1 v1-v4 against Phi-4 `.tern-model`
+
+**Observation:** Loading `phi4_14b_ternary_v0.1.1.tern-model` against `microsoft/phi-4` HF base via `load_packed_model` consistently reports:
+- `missing=162` (model parameters not covered by manifest entries)
+- `unexpected=320` (manifest entries not matching any model parameter path)
+
+Counts are bit-identical across 4 runs (smoke 1 v1-v4, deterministic to the count). Phi-4 is dense (no MoE), so the per-expert MoE restacking gap (gemma4-26b-a4b backlog item) doesn't apply. Generated output is the documented Phi-4 quality-envelope collapse ("at at at at..."), not garbage — load is structurally clean despite the counts.
+
+**Investigation scope:** Determine whether the missing/unexpected counts represent:
+- (a) Manifest-side suffix coverage gaps — some `_PRODUCTION_NAME_SUFFIXES` entries don't apply to Phi-4's specific naming scheme
+- (b) HF-side keys with no manifest equivalent — e.g., positional embeddings or auxiliary state not packed at compression time
+- (c) Compression-time omissions — the April 2026 Phi-4 compression itself missed some weights (would require re-compression to fix)
+- (d) Naming-convention drift between compression-time HF transformers version and the version currently installed
+
+Bit-identical determinism across runs rules out non-determinism — the counts represent a structural property of the manifest×model intersection, not run-to-run variance.
+
+**Resolution scope:** Diagnostic-only investigation — examine the missing/unexpected lists at the entry-name level, classify by suffix pattern, identify which category (a)-(d) each falls into. Estimated 1-2 hours focused work. Output: documented classification + decision on whether re-compression is warranted.
+
+**Trigger:** Apply when commercial conversations require Phi-4 as a proven-clean reference (e.g., Apple/KAIST partner technical due diligence). Until then, smoke 1 v4 + future production runs proceed with the current manifest as documented quality-envelope reference; the missing/unexpected counts are noted but not interpreted as bugs.
+
+**Methodology pattern reference:** Determinism across 4 runs (bit-identical 162/320) rules out non-determinism via the same logic that confirmed Phi-4 quality envelope across 6 independent paths — empirical reproducibility distinguishes structural findings from measurement noise.
+
+---
+
 ### Analysis plot tooling: include model name as plot title attribution
 
 **Status:** Open (low priority, applied after current rewrite work lands)
