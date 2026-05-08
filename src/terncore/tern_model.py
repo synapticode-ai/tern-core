@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import struct
 import time
 import zlib
@@ -30,6 +31,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from terncore.arithmetic.quantizer import TernaryQuantizer
 from terncore.sparse import pack_ternary_weights, unpack_ternary_weights
+
+logger = logging.getLogger(__name__)
 
 # Format constants
 TERN_MAGIC = b"TERN"
@@ -59,18 +62,165 @@ GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
 
 
 # ── Manifest naming convention ───────────────────────────────────────
-# Production .tern-model artefacts (e.g. gemopus-4-e4b) store manifest
-# entry names that already include parameter/buffer suffixes, while test
-# fixtures use bare layer names. reconstruct_all detects the convention
-# per-entry by suffix matching against this list. Empirically derived
-# from the gemopus-4-e4b manifest; extend as additional production
-# manifest formats are encountered.
+# Production .tern-model artefacts (e.g. gemopus-4-e4b, gemma4-26b-a4b,
+# gemma4-31b, qwen3-30b-a3b, phi-4) store manifest entry names that
+# already include parameter/buffer suffixes, while test fixtures use
+# bare layer names. ``reconstruct_all`` and ``load_packed_model`` detect
+# the convention per-entry by suffix matching against this list.
+#
+# Origin: empirically derived from gemopus-4-e4b manifest (2026-05-03).
+# Extended 2026-05-07 during ``load_packed_model`` rewrite after
+# probing all 7 compressed manifests on disk:
+#   - .per_expert_scale: gemma4-26b-a4b MoE per-expert routing scales (30 entries)
+#   - .scale: gemma4-26b-a4b generic per-tensor scale tensor (30 entries)
+#   - .std_bias / .std_scale: gemma4 family standardisation parameters
+#
+# Extend further as additional production manifest formats are encountered.
+# Loud failure on unknown suffixes is preferred over silent module-path
+# misclassification.
 _PRODUCTION_NAME_SUFFIXES = (
     ".weight", ".bias",
     ".input_max", ".input_min", ".output_max", ".output_min",
     ".layer_scalar", ".per_dim_scale",
+    ".per_expert_scale", ".scale",
+    ".std_bias", ".std_scale",
     ".position_embedding_table",
 )
+
+
+def _resolve_param_path(name: str) -> Tuple[str, Optional[str]]:
+    """Detect manifest-entry naming convention.
+
+    Manifest entries follow one of two conventions:
+
+    - **Parameter-path** (production convention used by ``convert.py:full_convert``):
+      entry name ends with a known parameter suffix (e.g. ``.weight``,
+      ``.bias``, ``.layer_scalar``). Returns ``(module_path, param_name)``
+      where ``module_path`` is the entry name with the suffix stripped
+      and ``param_name`` is the suffix without the leading dot.
+
+    - **Module-path** (test convention used by ``add_layer("fc1", ...)``):
+      entry name doesn't match any known suffix; treat it as a bare
+      module identifier. Returns ``(name, None)``.
+
+    The suffix list (``_PRODUCTION_NAME_SUFFIXES``) is empirically
+    derived from probing all production manifests on disk. Adding new
+    suffixes is cheap; missing one means production entries with that
+    suffix get misclassified as module-path naming, which would lose
+    the entry. New manifest formats should extend the list rather than
+    rely on heuristics.
+    """
+    for suffix in _PRODUCTION_NAME_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)], suffix[1:]
+    return name, None
+
+
+def _resolve_module_or_raise(
+    root: "nn.Module",
+    path: str,
+    *,
+    diagnostic_entry_name: str,
+) -> "nn.Module":
+    """Walk ``path`` (dotted) on ``root`` and return the resolved module.
+
+    Raises ``ValueError`` with diagnostic info naming the manifest entry
+    and the missing path component when traversal fails. Loud failure
+    over silent skipping per ``load_packed_model`` rewrite discipline.
+    """
+    if not path:
+        return root
+    parts = path.split(".")
+    current = root
+    walked: list[str] = []
+    for part in parts:
+        if not hasattr(current, part):
+            raise ValueError(
+                f"Manifest entry {diagnostic_entry_name!r} resolves to module "
+                f"path {path!r}, but component {part!r} does not exist on "
+                f"the model (walked: {'.'.join(walked) or '<root>'}). Either "
+                f"the manifest was packed against a different architecture, "
+                f"or a key_mapping is required. Use the ``key_mapping=`` "
+                f"argument to translate prefixes, or load against the "
+                f"correct base architecture."
+            )
+        current = getattr(current, part)
+        walked.append(part)
+    return current
+
+
+def _replace_submodule_or_raise(
+    root: "nn.Module",
+    path: str,
+    new_module: "nn.Module",
+    *,
+    diagnostic_entry_name: str,
+) -> None:
+    """Replace the submodule at dotted ``path`` on ``root`` with ``new_module``.
+
+    Walks ``parts[:-1]`` on root, then ``setattr(parent, parts[-1], new_module)``.
+    Used by the ternary branch to install ``PackedTernaryLinear`` instances
+    in place of the original ``nn.Linear`` submodules.
+
+    Raises ``ValueError`` with diagnostic info if the parent path doesn't
+    resolve cleanly. Loud failure over silent skipping.
+    """
+    if not path:
+        raise ValueError(
+            f"Manifest entry {diagnostic_entry_name!r} resolves to empty "
+            f"module path; cannot replace root module."
+        )
+    parts = path.split(".")
+    if len(parts) == 1:
+        # Top-level submodule replacement
+        if not hasattr(root, parts[0]):
+            raise ValueError(
+                f"Manifest entry {diagnostic_entry_name!r} resolves to module "
+                f"path {path!r}, but {parts[0]!r} does not exist at the model "
+                f"root."
+            )
+        setattr(root, parts[0], new_module)
+        return
+    parent = _resolve_module_or_raise(
+        root, ".".join(parts[:-1]),
+        diagnostic_entry_name=diagnostic_entry_name,
+    )
+    if not hasattr(parent, parts[-1]):
+        raise ValueError(
+            f"Manifest entry {diagnostic_entry_name!r} resolves to module "
+            f"path {path!r}, but final component {parts[-1]!r} does not "
+            f"exist on parent {'.'.join(parts[:-1])!r}."
+        )
+    setattr(parent, parts[-1], new_module)
+
+
+def _resolve_parameter_or_raise(
+    root: "nn.Module",
+    module_path: str,
+    param_name: str,
+    *,
+    diagnostic_entry_name: str,
+) -> "torch.nn.Parameter":
+    """Walk ``module_path`` on ``root`` and return the named parameter.
+
+    Used by the FP16 branch to access an arbitrary parameter (weight,
+    bias, layer_scalar, per_expert_scale, calibration tensor, etc.) on
+    the resolved module. Raises ``ValueError`` with diagnostic info if
+    the module or parameter doesn't exist. Loud failure over silent
+    skipping.
+    """
+    module = _resolve_module_or_raise(
+        root, module_path,
+        diagnostic_entry_name=diagnostic_entry_name,
+    )
+    if not hasattr(module, param_name):
+        raise ValueError(
+            f"Manifest entry {diagnostic_entry_name!r} resolves to "
+            f"parameter {param_name!r} on module path {module_path!r}, but "
+            f"that parameter does not exist on the resolved module "
+            f"(type {type(module).__name__})."
+        )
+    return getattr(module, param_name)
 
 
 def _align_to(offset: int, alignment: int = ALIGNMENT) -> int:
@@ -1222,7 +1372,9 @@ class TernModelReader:
     # ── Packed loading ──────────────────────────────────────────
 
     def load_packed_model(
-        self, model: nn.Module
+        self,
+        model: nn.Module,
+        key_mapping: Optional[Dict[str, str]] = None,
     ) -> Tuple[list[str], list[str]]:
         """
         Load .tern-model weights as PackedTernaryLinear layers.
@@ -1232,8 +1384,36 @@ class TernModelReader:
 
         For FP16 layers: load as regular nn.Linear weights.
 
+        For INT4 (``int4_block32``) layers: dequantise via
+        ``_reconstruct_int4`` and assign the FP32 result to the target
+        parameter via the parameter-path-aware traversal. **B.1 trade-off**:
+        runtime memory footprint for INT4 entries matches FP32, not INT4.
+        Production exposure is small (~20 INT4 entries across all 5
+        manifests, all cross-applied sensitivity-map fallbacks for
+        high-error layers). The runtime-memory-preserved variant
+        (PackedINT4Linear, B.2) is banked as a low-priority backlog item
+        for future work when commercial pressure justifies the
+        implementation cost. An INFO-level log message at first INT4
+        entry encountered surfaces this trade-off explicitly so
+        operators see it in load output.
+
         Args:
             model: PyTorch model to modify in-place.
+            key_mapping: Optional prefix-rewrite map applied to manifest
+                entry names BEFORE parameter-path resolution. Use named
+                presets like ``GEMMA4_MULTIMODAL_TRANSFORMERS_5_5`` to
+                bridge transformers API drift between artefact pack-time
+                and load-time (e.g., a manifest packed against
+                pre-5.5 transformers can load against transformers 5.5+
+                models that moved language-model components under
+                ``model.language_model.*``). Mirrors the same parameter
+                on ``load_as_model`` for parity.
+
+                Permissive semantics: entry names that don't match any
+                source key in the mapping pass through unchanged.
+                Downstream ``_resolve_module_or_raise`` provides loud
+                failure if the (translated or untranslated) name doesn't
+                resolve on the model.
 
         Returns:
             (missing_keys, unexpected_keys) analogous to load_state_dict.
@@ -1244,10 +1424,35 @@ class TernModelReader:
         model_keys = set(dict(model.named_parameters()).keys())
         model_keys.update(dict(model.named_buffers()).keys())
 
+        # Per-call counter for INT4 entries — drives the operator-visible
+        # log message (one-shot per load_packed_model invocation, not a
+        # process-global flag, so multiple loads in one session each
+        # surface the trade-off independently).
+        int4_count = sum(
+            1 for entry in self.manifest["layers"]
+            if entry.get("dtype") == "int4_block32"
+        )
+        int4_load_logged = False
+
         for entry in self.manifest["layers"]:
-            name = entry["name"]
-            raw = self.read_layer_data(name)
+            raw_name = entry["name"]
+            # Apply key_mapping translation BEFORE parameter-path
+            # resolution. Mirrors the inline pattern from load_as_model
+            # (first match wins; names not in mapping pass through).
+            name = raw_name
+            if key_mapping:
+                for src, dst in key_mapping.items():
+                    if raw_name.startswith(src):
+                        name = dst + raw_name[len(src):]
+                        break
+            raw = self.read_layer_data(raw_name)
             buf = io.BytesIO(raw)
+
+            # Detect parameter-path naming (production) vs module-path
+            # naming (test). Routes both branches uniformly without
+            # silent-skip / TypeError failure modes documented in
+            # docs/backlog.md "load_packed_model rewrite".
+            module_path, param_name = _resolve_param_path(name)
 
             if entry["dtype"] == "ternary2":
                 # Read alpha and packed weights directly
@@ -1285,32 +1490,99 @@ class TernModelReader:
                     sparsity_bitmap=bitmap_tensor,
                 )
 
-                # Replace module in model
-                parts = name.split(".")
-                parent = model
-                for part in parts[:-1]:
-                    parent = getattr(parent, part)
-                setattr(parent, parts[-1], packed_layer)
+                # Module replacement: walk the module path and replace
+                # the named submodule with the packed layer. For
+                # parameter-path naming (production), module_path is
+                # already the path-without-suffix (e.g. ``model.layers.0.q_proj``);
+                # for module-path naming (test convention), module_path
+                # is the entry name as-is (e.g. ``fc1``).
+                _replace_submodule_or_raise(
+                    model, module_path, packed_layer,
+                    diagnostic_entry_name=raw_name,
+                )
 
-                loaded_keys.append(f"{name}.packed_weights")
-                loaded_keys.append(f"{name}.alpha")
+                loaded_keys.append(f"{module_path}.packed_weights")
+                loaded_keys.append(f"{module_path}.alpha")
                 if bias is not None:
-                    loaded_keys.append(f"{name}.bias")
+                    loaded_keys.append(f"{module_path}.bias")
 
             elif entry["dtype"] == "float16":
                 tensors = self._reconstruct_fp16(buf, entry)
-                # Set weight on the existing module
-                parts = name.split(".")
-                parent = model
-                for part in parts[:-1]:
-                    parent = getattr(parent, part)
-                module = getattr(parent, parts[-1])
-                if isinstance(module, nn.Linear):
-                    module.weight.data = tensors["weight"]
-                    loaded_keys.append(f"{name}.weight")
-                    if "bias" in tensors and module.bias is not None:
-                        module.bias.data = tensors["bias"]
-                        loaded_keys.append(f"{name}.bias")
+
+                if param_name is None:
+                    # Module-path naming (test convention): walk to the
+                    # named submodule, assign weight + optional bias.
+                    parts = module_path.split(".")
+                    parent = model
+                    for part in parts[:-1]:
+                        parent = getattr(parent, part)
+                    module = getattr(parent, parts[-1])
+                    if isinstance(module, nn.Linear):
+                        module.weight.data = tensors["weight"]
+                        loaded_keys.append(f"{module_path}.weight")
+                        if "bias" in tensors and module.bias is not None:
+                            module.bias.data = tensors["bias"]
+                            loaded_keys.append(f"{module_path}.bias")
+                    # Non-Linear modules under module-path naming are
+                    # not currently exercised by tests; silent-skip
+                    # behaviour preserved here for backwards compat.
+                else:
+                    # Parameter-path naming (production): walk to the
+                    # parent of the parameter, set the parameter's data.
+                    # Handles nn.Linear, nn.LayerNorm, nn.Embedding, and
+                    # arbitrary module-level Parameters (layer_scalar,
+                    # per_expert_scale, calibration tensors, etc.)
+                    # uniformly.
+                    target_param = _resolve_parameter_or_raise(
+                        model, module_path, param_name,
+                        diagnostic_entry_name=raw_name,
+                    )
+                    target_param.data = tensors["weight"]
+                    loaded_keys.append(name)
+
+            elif entry["dtype"] == "int4_block32":
+                # B.1 design: dequantise INT4 to FP32 at load, assign to
+                # target parameter. Runtime memory footprint matches FP32
+                # rather than INT4. Production exposure small (~20 entries
+                # across all manifests). PackedINT4Linear (B.2) banked as
+                # backlog item for future commercial-driven implementation.
+                if not int4_load_logged:
+                    logger.info(
+                        "Loading %d INT4 entries via dequantise-to-FP32 path. "
+                        "Runtime memory footprint for these entries matches "
+                        "FP32, not INT4. Banked optimisation: PackedINT4Linear "
+                        "for runtime-memory-preserved INT4 inference "
+                        "(cf. docs/backlog.md).",
+                        int4_count,
+                    )
+                    int4_load_logged = True
+
+                tensors = self._reconstruct_int4(buf, entry)
+
+                if param_name is None:
+                    # Module-path naming (test convention): no production
+                    # manifests currently exercise this path for INT4, but
+                    # preserve symmetry with FP16 branch.
+                    parts = module_path.split(".")
+                    parent = model
+                    for part in parts[:-1]:
+                        parent = getattr(parent, part)
+                    module = getattr(parent, parts[-1])
+                    if isinstance(module, nn.Linear):
+                        module.weight.data = tensors["weight"]
+                        loaded_keys.append(f"{module_path}.weight")
+                        if "bias" in tensors and module.bias is not None:
+                            module.bias.data = tensors["bias"]
+                            loaded_keys.append(f"{module_path}.bias")
+                else:
+                    # Parameter-path naming (production): same path as
+                    # FP16 branch — walk to the parameter, set its .data.
+                    target_param = _resolve_parameter_or_raise(
+                        model, module_path, param_name,
+                        diagnostic_entry_name=raw_name,
+                    )
+                    target_param.data = tensors["weight"]
+                    loaded_keys.append(name)
 
         missing = [k for k in model_keys if k not in loaded_keys]
         unexpected = [k for k in loaded_keys if k not in model_keys]
