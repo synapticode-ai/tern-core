@@ -116,22 +116,54 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _turboquant_compressed_bytes(tqc) -> int:
+    """Sum byte sizes of torch.Tensor fields on a TurboQuantCompressed.
+
+    Traverses ``pq`` (PolarQuantCompressed) and ``qjl`` (QJLCompressed).
+    Counts direct torch.Tensor fields only — does NOT recurse into nested
+    objects like ``rotation`` (RandomHadamardRotation) or ``codebook``
+    (Codebook), which contain their own tensor state. Those nested
+    tensors are typically shared across all positions in a layer×head
+    and thus don't represent per-position storage cost.
+
+    API discovered empirically 2026-05-08 after smoke 1 failed with
+    ``AttributeError: 'TurboQuantCompressed' object has no attribute 'numel'``
+    — the original assumption that compressor.compressed leaves were
+    torch.Tensor was inferred from variable naming, not probed by
+    running an actual compression. Banked as 11th probe-before-committing
+    instance.
+    """
+    total = 0
+    for component in (tqc.pq, tqc.qjl):
+        for field_name in component.__dataclass_fields__:
+            value = getattr(component, field_name, None)
+            if isinstance(value, torch.Tensor):
+                total += value.numel() * value.element_size()
+    return total
+
+
 def _kv_cache_compressed_bytes_snapshot(
     compressor: IncrementalTQCompressor,
 ) -> int:
-    """Sum byte sizes of all compressed KV tensors in compressor.compressed.
+    """Sum byte sizes of all compressed KV state in compressor.compressed.
 
-    SNAPSHOT semantics: this represents what TurboQuant would store
-    under its compression scheme. Under the existing open-loop pipeline,
-    the model's inference path uses the uncompressed ``past_key_values``
+    Traverses the 3-level nested structure ``[layer][head][position_batch]``,
+    where each leaf is a ``(k_c, v_c)`` tuple of ``TurboQuantCompressed``
+    instances. Per-instance bytes computed via
+    ``_turboquant_compressed_bytes`` (direct dataclass tensor fields,
+    excluding shared nested objects).
+
+    SNAPSHOT semantics: represents what TurboQuant would store under
+    its compression scheme. Under the existing open-loop pipeline, the
+    model's inference path uses the uncompressed ``past_key_values``
     not this snapshot.
     """
     total = 0
     for layer in compressor.compressed:
         for head in layer:
             for k_c, v_c in head:
-                total += k_c.numel() * k_c.element_size()
-                total += v_c.numel() * v_c.element_size()
+                total += _turboquant_compressed_bytes(k_c)
+                total += _turboquant_compressed_bytes(v_c)
     return total
 
 
@@ -350,9 +382,11 @@ def main() -> int:
             "kv_cache_hypothetical_compression_ratio": hypothetical_ratio,
             "scope_note": (
                 "Snapshot represents what TurboQuant would store under its "
-                "compression scheme. 'Hypothetical' because the existing "
-                "pipeline is open-loop — the snapshot is not substituted "
-                "back into the model's inference path."
+                "compression scheme — direct dataclass tensor fields only "
+                "(rotation/codebook nested objects excluded as typically "
+                "shared across positions in a layer×head). 'Hypothetical' "
+                "because the existing pipeline is open-loop — the snapshot "
+                "is not substituted back into the model's inference path."
             ),
         },
         "generation": {
