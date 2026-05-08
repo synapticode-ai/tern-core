@@ -48,6 +48,19 @@ convention untested until Phase 2.
 
 **Estimated effort:** 4–6 hours focused work with PR.
 
+**Acceptance criteria (adjusted for both M4 Pro 64 GB hardware ceiling AND per-expert-sliced MoE restacking deferral):**
+- All compressed manifests that **(a)** fit in M4 Pro 64 GB unified memory AND **(b)** use single-tensor-per-entry naming load via `load_packed_model` without silent entry skipping or silent corruption — verified via `tests/test_load_packed_model_production_integration.py`
+- Phi-4 (dense, fits 27 GB) integration verified with quality-envelope characterisation (`expect_coherent_generation=False` per disambiguation finding 2026-05-08; load + clean logits asserted, repetition collapse documented as known outcome rather than asserted against)
+- gemma4-26b-a4b (MoE, fits 48 GB) integration test `xfail`-marked pending MoE per-expert restacking — verified empirically 2026-05-08 that the loud-failure surface fires correctly on the per-expert-sliced × stacked-tensor architectural mismatch (cf. backlog item "load_packed_model: MoE per-expert restacking")
+- 30B+ class manifests (gemma4-31b ~58 GB FP16, qwen3-30b-a3b ~57 GB FP16) explicitly skipped with documented hardware constraint per TN-001 / `pytest.mark.skip`; same M4 Pro 64 GB ceiling that makes Llama-3.1-70B "demo artefact only" applies
+- Mistral-7B compressed artefact NOT on disk (verified via filesystem probe 2026-05-07); skipped with documented absence
+- Synthetic-fixture coverage in `tests/test_load_packed_model_production_naming.py` verifies the same code paths on architecturally-equivalent small dense models — exercises every bug path independent of hardware ceiling. **Note:** synthetic dense fixtures do NOT cover per-expert-sliced MoE × stacked-tensor HF intersection; that gap surfaced empirically only via gemma4-26b-a4b production retest and is the validation-infrastructure finding banked as Instance 9 of `pattern_probe_before_committing_implementation_v1`.
+- Loaded models produce either non-garbage outputs OR documented quality-envelope collapse on a 50-token smoke probe per in-scope model — pragmatic eyeball check via test stdout, gated by `expect_coherent_generation` parametrise field
+- `key_mapping` parameter accepts `GEMMA4_MULTIMODAL_TRANSFORMERS_5_5` and other future drift presets — verified empirically via gemma4-26b-a4b retest 2026-05-08 (key_mapping translation worked correctly; failure occurred in per-expert walk after translation, isolating the failure mode to the restacking gap rather than the key_mapping path)
+- Loud-failure surface: `_resolve_module_or_raise` + `_resolve_parameter_or_raise` raise `ValueError` with diagnostic info naming manifest entry + missing path component when traversal fails — never silent skip / silent corruption / silent reporting drift; verified empirically by gemma4-26b-a4b retest surfacing per-expert MoE restacking gap as a clean loud-failure with full diagnostic context
+
+Original criterion ("All 5 manifests load") was written without M4 Pro 64 GB factored in AND without the per-expert MoE restacking gap surfaced; adjusted to "manifests that fit in 64 GB AND use single-tensor-per-entry naming" framing with documented skip / xfail reasons for the rest. Future hardware (M4 Max, M5, Mac Studio 128+ GB) unblocks the hardware-ceiling cases without code changes; MoE restacking work (banked as separate backlog item, scheduled for L5 sprint week of 2026-05-12) unblocks the gemma4-26b-a4b xfail.
+
 ---
 
 ### Known architecture quirk: full_attention v_proj absence (gemma4 26B-A4B)
@@ -87,6 +100,57 @@ convention untested until Phase 2.
 **Surfaced:** 2026-05-06 Wednesday-night queue planning
 **Observation:** License accepted on HF Hub 2026-04-09; source weights (~140 GB FP16) never pulled. Only `refs/main` SHA reference cached, no snapshots/blobs. The existing compressed `.tern-model` artefact at `/Volumes/Syn Archive/models/compressed/llama-3-1-70b/llama70b-v0.6.0-mixed.tern-model` (37 GB) already serves as cross-model reference for analysis work (used in Session 4 per-expert tolerance analysis 2026-05-06).
 **Resolution scope:** Fire `hf download meta-llama/Llama-3.1-70B-Instruct` when a specific need arises that the existing compressed artefact can't satisfy (e.g., recompression with v2 Metal forward path improvements, full-precision baseline experiments, cross-validation). ~140 GB / ~1-2 hours overnight.
+
+---
+
+### Phi-4 ternary recompression at lower threshold — quality-envelope characterisation
+
+**Status:** Open (medium priority, gated on TN-003 baseline measurement priorities)
+**Surfaced:** 2026-05-08 by Rob during Friday morning Phi-4 disambiguation
+**Observation:** April 2026 Phi-4 compression at threshold 0.7 (`phi4_14b_ternary_v0.1.1.tern-model`) produces repetition collapse in greedy generation ("at at at at..." after the input prompt). Disambiguated 2026-05-08 via cross-path methodology — loaded the same `.tern-model` artefact via `load_as_model` (the structurally independent dequantise-to-FP32 + `load_state_dict` path) and observed identical collapse with clean logits (no NaN/Inf, shape correct). Two structurally independent load paths producing identical observable outcome rules out load-infrastructure bugs and confirms the issue as a quality-envelope property of Phi-4 ternary at threshold 0.7. PR #16's structural-equivalence anchor for Phi3Adapter validation passed (manifest entries match), but inference quality was never empirically measured at integration time.
+
+**Resolution scope:** Recompress Phi-4 at lower threshold and rerun the disambiguation smoke probe. Suggested first probe at 0.5 (operating-range floor per `~/synapticode/CLAUDE.md`'s typical operating range 0.5-0.9). If coherent generation returns at 0.5, sweep upward toward 0.6, 0.65 to find the compression-vs-quality optimum and bank the threshold curve as quality-envelope reference data for Phi-4. If 0.5 also collapses, the finding is below threshold-tuning intervention scope and requires different methodological approach (model-specific calibration, layer-wise sensitivity scan extension, possibly a Phi-4-specific protected-layers list). Applies the same per-model threshold calibration pattern that v0.6.0 sensitivity scan establishes for high-error layers, but at the model-level rather than layer-level granularity.
+
+**Trigger:** Apply when TN-003 baseline measurement planning needs Phi-4 as a coherent-generation reference point. If Friday afternoon's TurboQuant baseline work proceeds with Phi-4 as quality-envelope-documented (acceptable for KV-cache compression characterisation), this item defers. If commercial conversations (Apple/KAIST briefing) require Phi-4 as a coherent-generation demo artefact, prioritise.
+
+**Estimated effort:** ~2-3 hours per threshold pass (compression + smoke probe + disambiguation). Single-threshold Phi-4 recompression at 0.5 ~3 hours wall-clock. If 0.5 returns coherent generation, additional ~3 hours per upward-sweep threshold. If 0.5 collapses, scope shifts to a different methodological investigation (out of this item's bound).
+
+**Methodology pattern reference:** This finding extends `pattern_probe_before_committing_implementation_v1` with the cross-path disambiguation as a concrete instance — empirical probe (`load_as_model` independent path) ruled out predicted mechanism (load infrastructure bug) and confirmed actual mechanism (quality envelope).
+
+---
+
+### load_packed_model: MoE per-expert restacking for stacked-tensor architectures
+
+**Status:** Open (medium priority, natural integration with L5 sprint planned for week of 2026-05-12)
+**Surfaced:** 2026-05-08 by gemma4-26b-a4b production manifest integration retest during PR #18 verification
+
+**Observation:** PR #14's per-expert slicing rework produces compressed manifests with 128 separate `experts.N.{gate,up,down}_proj.weight` entries per layer (Gemma 4 family) for per-expert sparsity measurement granularity. PR #18's `load_packed_model` rewrite handles per-entry dispatch (one entry → one module replacement or parameter assignment). The intersection — loading per-expert-sliced MoE manifests back into HF MoE models that expose experts as stacked-tensor Parameters (e.g., `model.language_model.layers.0.experts.gate_up_proj` with first dim = 128) rather than ModuleList of individual expert modules — was never empirically tested before 2026-05-08's gemma4-26b-a4b retest.
+
+`_resolve_module_or_raise` correctly raises `ValueError` on the first `experts.0` lookup since `experts` is a stacked-tensor `nn.Parameter`, not a `nn.ModuleList`. Loud-failure surface working as designed; the structural gap is in `load_packed_model`'s dispatch logic, not in the loud-failure helpers.
+
+**Resolution scope:** Implement per-expert-naming detection + restacking dispatch in `load_packed_model`. Pattern: detect entries matching `experts.N.<projection>` naming → group by parent path + projection name → reconstruct stacked tensor by stacking 128 per-expert dequantised weights along dim 0 → assign to the parent's stacked-tensor parameter. Mirrors `reconstruct_all`'s restacking logic from PR #14 but applied at `PackedTernaryLinear` creation time (or, for stacked tensors, at parameter assignment time — design probe required to determine which is correct).
+
+Test coverage: synthetic fixture mirroring Gemma 4 MoE expert structure (small N experts × small projections) for unit testing; production integration test against gemma4-26b-a4b (currently xfail) for end-to-end verification.
+
+**Trigger:** Natural integration with next-week L5 sprint (week of 2026-05-12). The L5 lifecycle work on Qwen3-30B-A3B (Tier 1 per Rob's sprint planning context) and DeepSeek-V4-Flash (Tier 3) requires MoE expert paging + demand-loading + restacking; per-expert restacking in `load_packed_model` is a prerequisite for the demand-paging implementation. Sequencing: restacking work lands first as foundation, then L5 lifecycle work builds on top.
+
+**Estimated effort:** ~3-4 hours focused work — design probe (per-expert naming detection + restacking dispatch placement) + implementation + synthetic fixture tests + xfail removal on gemma4-26b-a4b production test + retest cycle (~45 min wall-clock).
+
+**Methodology pattern reference:** This is the 9th and most consequential instance of `pattern_probe_before_committing_implementation_v1` — caught a structural gap in validation infrastructure (synthetic dense fixtures don't cover per-expert-sliced MoE × stacked-tensor HF model intersection) that would have been a silent gap in PR #18 acceptance had we proceeded to merge based on synthetic-fixture coverage alone. Empirical production-manifest retest was required to surface the gap.
+
+---
+
+### Analysis plot tooling: include model name as plot title attribution
+
+**Status:** Open (low priority, applied after current rewrite work lands)
+**Surfaced:** 2026-05-08 by Rob during Friday morning Phi-4 disambiguation wait
+**Observation:** `benchmarks/analyse_per_expert_tolerance.py` plot output (and any sibling plot generators) currently relies on filename + directory path for model attribution. This is fragile — plots saved standalone, embedded in briefing slides, sent to external reviewers (Eagle for IP review, Apple/KAIST partners), or aggregated for comparative work lose directory-path provenance.
+
+**Resolution scope:** Update plot title format to include model identification visibly on the graph itself. Suggested format: `"Sparsity distribution: expert_ffn vs dense_ffn — <model_id>"` where `<model_id>` is derived from manifest metadata (e.g., "Phi-4", "Qwen3-30B-A3B", "Gemma 4 26B-A4B"). Apply across all plot types in the analysis pipeline (distribution overlay, per-layer scatter, per-expert heatmap, external reference comparison).
+
+**Trigger:** Apply after current `load_packed_model` rewrite work lands (PR #18 merged). Should land before Friday afternoon's TurboQuant baseline comparative plots — those will be more numerous, more likely to be shared externally, and carry more commercial weight.
+
+**Estimated effort:** ~30 min focused work + small test update.
 
 ---
 
