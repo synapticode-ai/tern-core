@@ -140,6 +140,38 @@ Test coverage: synthetic fixture mirroring Gemma 4 MoE expert structure (small N
 
 ---
 
+### Close TurboQuant compress→decompress loop for true quality measurement
+
+**Status:** Open (medium priority, gates true TurboQuant quality baseline measurement)
+**Surfaced:** 2026-05-08 by orchestration-script pre-implementation probe of `generate_streaming_turboquant` body
+
+**Observation:** Existing TurboQuant integration at `tools/tern_infer.py:220+` records compressed KV state as a side effect (`compressor.append(past_key_values)`) but does NOT substitute decompressed state back into the model's next forward pass. The loop reads:
+
+```python
+outputs = model(..., past_key_values=past_key_values, use_cache=True)
+past_key_values = outputs.past_key_values  # uncompressed, from model output
+compressor.append(past_key_values)         # records compressed copy as side effect
+# next iteration uses uncompressed past_key_values; compressor.compressed never read back
+```
+
+The integration measures compression overhead + footprint but NOT quality impact. PPL on WikiText-2 with TurboQuant in the loop returns the same number as without — the compression doesn't enter the inference path.
+
+**Resolution scope:** Modify `generate_streaming_turboquant` (or a sibling function) to: get past_key_values from model output → compress via `compressor.append()` → decompress via TurboQuant decode path → feed decompressed past_key_values to next forward pass. PPL measurement with the closed loop reflects TurboQuant's actual quality impact.
+
+Design surface required:
+- TurboQuant decompression API location (likely `src/cache.py:turboquant_decode_internal` or similar — needs discovery; encoder is at `cache.py:793`)
+- HF model attention layer compatibility with substituted past_key_values (HF Cache class may have constraints on tensor identity / contiguity)
+- Performance trade-off: decompression overhead per token may dominate generation wall-clock
+- Decompression precision: 3-bit quantised → FP16/FP32 round-trip introduces noise; quantisation error becomes attention computation error
+
+**Trigger:** Apply when TN-003 baseline measurement requires true quality comparison. Open-loop measurement (compression overhead + footprint, banked Friday afternoon) is sufficient for "what does TurboQuant cost to compute?" questions but does not answer "what does TurboQuant cost in quality?". Required for Apple/KAIST partner conversations that demand quality-vs-compression Pareto.
+
+**Estimated effort:** ~4-6 hours focused work — design probe (decompression API + substitution mechanism + attention compatibility) + implementation + perplexity comparison run + reproducibility verification.
+
+**Methodology pattern reference:** This is the 10th instance of `pattern_probe_before_committing_implementation_v1` — pre-implementation probe of the generation loop revealed the existing pipeline doesn't close the compression loop. Surfaces hidden assumptions about what existing code actually does vs what it appears to do at API surface level.
+
+---
+
 ### Analysis plot tooling: include model name as plot title attribution
 
 **Status:** Open (low priority, applied after current rewrite work lands)

@@ -42,6 +42,8 @@ The existing TurboQuant integration at `tools/tern_infer.py:149+` operates on th
 
 **Status update 2026-05-08**: Friday morning's first deliverable — the `load_packed_model` rewrite — landed via PR #18 (merged 10:18:57 AEST). Two findings emerged from empirical retest cycles that adjust downstream scope: (a) Phi-4 ternary at threshold 0.7 produces repetition collapse (quality envelope, not load bug — disambiguated via cross-path methodology), and (b) gemma4-26b-a4b production retest surfaced per-expert-sliced MoE × stacked-tensor HF intersection requiring restacking dispatch (banked as backlog item, deferred to L5 sprint). The remaining Friday afternoon work — TurboQuant adapter from `.tern-model` path + standalone perplexity harness — is now unblocked.
 
+**Further scope clarification 2026-05-08 (post-probe-C)**: pre-implementation probe of the TurboQuant generation loop revealed the existing pipeline is open-loop (compresses KV as a side effect; does not substitute decompressed KV back into next forward pass). Friday afternoon's measurement scope is therefore "compression overhead + footprint" rather than "quality impact". Closed-loop integration banked separately as backlog item; gates true quality-vs-compression Pareto measurement.
+
 ---
 
 ## Categories of additive compression
@@ -72,6 +74,8 @@ Trains a smaller "student" model to imitate a larger "teacher." Sequential pipel
 **Confidence**: Verified context. Live integration in tern-core; README v0.1.0 documents combined-stack benchmark; Bash probe earlier this session inspected the actual integration code at `tools/tern_infer.py:149-218`.
 
 **Current tern-core integration**: `IncrementalTQCompressor` class at `tools/tern_infer.py:149+`. Operates on the v0.1.0 path (HF model + on-the-fly `MixedPrecisionConverter`). README v0.1.0 cites Mistral-7B at ~3.5 GB total Apple Silicon footprint against this path (combined with weight ternary).
+
+**Integration scope clarification (2026-05-08)**: pre-implementation probe of `generate_streaming_turboquant` revealed the existing integration is **open-loop** — `compressor.append(past_key_values)` records compressed KV state as a side effect, but the model's next forward pass uses the original uncompressed `past_key_values` from the previous output. The compressed state in `compressor.compressed[][]` is never read back into inference. The integration therefore measures TurboQuant's compression operation overhead and compressed footprint, but NOT quality impact on generation. Closed-loop integration (compress → decompress → substitute) is banked as backlog item "Close TurboQuant compress→decompress loop for true quality measurement".
 
 **Infrastructure gap**: Not yet measured against per-expert sliced `.tern-model` artefacts (PR #14-#17 pipeline). See "Critical infrastructure gap" above.
 
@@ -240,7 +244,7 @@ Two probes against the actual codebase before harness implementation surfaced th
 **Re-scoped decomposition (3 items):**
 
 1. **WikiText-2 perplexity harness** (~1-1.5 hr): Extract `_measure_perplexity` body to standalone callable; add HF `datasets` library WikiText-2 loader (`wikitext-2-raw-v1`, validation split per landscape doc convention); add sliding-window PPL computation. Public API: `compute_perplexity(model, tokenizer, dataset_name="wikitext-2-raw-v1", split="validation", stride=512, max_length=2048) -> float`.
-2. **Measurement orchestration script** (~30-60 min): Wrapper that loads a `.tern-model` artefact via `load_packed_model`, runs `generate_streaming_turboquant`, collects metrics (perplexity via item 1; KV cache footprint via `IncrementalTQCompressor` API discovery at implementation time — likely `compressor.compressed[][]` traversal, but pending verification that introspection is straightforward attribute access rather than non-trivial traversal logic; peak RSS; wall-clock per token). Reports as a single JSON record per measurement run.
+2. **Measurement orchestration script** (~30-60 min): Wrapper that loads a `.tern-model` artefact via `load_packed_model`, runs a TurboQuant-aware generation loop (replicated inline from `generate_streaming_turboquant` to capture the compressor instance for footprint measurement), collects metrics with field names that disambiguate "compression overhead + footprint" from "quality impact" — `kv_cache_compressed_bytes_snapshot` (from `compressor.compressed[][]` traversal — verified 2026-05-08 as straightforward attribute access), `compression_operation_wall_clock_seconds` (TurboQuant `.append()` overhead component of generation), peak RSS, generation tokens-per-second, plus standalone WikiText-2 PPL via item 1 characterised as the **post-load_packed_model model's baseline PPL** (NOT TurboQuant quality impact — open-loop pipeline per loop-closure finding). Reports as a single JSON record per measurement run.
 3. **Smoke test on Phi-4** (~30 min): single end-to-end measurement against the in-scope Phi-4 `.tern-model` artefact. Per the size-diversity reality check in the Friday afternoon section, Phi-4 is the only `.tern-model` artefact in scope on M4 Pro 64 GB hardware. Verifies infrastructure works end-to-end before fanning out to KIVI/cluster-expansion work.
 
 **Net effort change**: ~2-2.5 hr (vs landscape doc's original 1-2 hr estimate). Larger than anticipated but redistributed — the perplexity harness is more substantive (dataset infra + sliding window), the adapter dissolves entirely.
@@ -251,7 +255,7 @@ Two probes against the actual codebase before harness implementation surfaced th
 
 Halt-and-surface discipline between technique integrations.
 
-1. **TurboQuant baseline against per-expert `.tern-model` artefacts**: scope reduced to **Phi-4 alone** for first measurement target. Empirical findings from Friday morning's PR #18 retest constrain the original 5-model framing:
+1. **TurboQuant baseline against per-expert `.tern-model` artefacts**: scope reduced to **Phi-4 alone** for first measurement target. **Scope clarification (2026-05-08 post-probe-C)**: "TurboQuant baseline" here means **compression overhead + footprint baseline** under the open-loop integration. True quality-vs-compression Pareto baseline gates on closed-loop integration (banked separately as "Close TurboQuant compress→decompress loop" backlog item). Empirical findings from Friday morning's PR #18 retest constrain the original 5-model framing:
    - Mistral-7B compressed artefact NOT on disk (filesystem-verified 2026-05-07; the original "5 manifests on disk" assumption was wrong)
    - Qwen3-30B-A3B exceeds M4 Pro 64 GB practical ceiling (~57 GB FP16 base load)
    - gemma4-26b-a4b xfail pending MoE per-expert restacking
@@ -269,8 +273,8 @@ Build on Friday's foundation. Calibration infrastructure (KVQuant), paper identi
 
 ### Quality metric framework (apples-to-apples for all techniques)
 
-- **Perplexity** on WikiText-2 validation split (`wikitext-2-raw-v1`, conventional choice for LLM perplexity benchmarking)
-- **KV cache footprint** at 4K context length (chosen for tractable wall-clock; long-context evaluation deferred unless KVQuant's 10M-context claim becomes the focus)
+- **Perplexity** on WikiText-2 validation split (`wikitext-2-raw-v1`, conventional choice for LLM perplexity benchmarking). **Under the existing open-loop TurboQuant integration, PPL reflects the model's baseline perplexity (load_packed_model output), NOT TurboQuant's quality impact — closed-loop integration banked separately.**
+- **KV cache footprint** at 4K context length (chosen for tractable wall-clock; long-context evaluation deferred unless KVQuant's 10M-context claim becomes the focus). **Footprint here is the snapshot of compressed bytes from the generation loop's `compressor.compressed[][]` traversal — represents what TurboQuant would store under its compression scheme, NOT what gets used at inference time, since the existing pipeline is open-loop.**
 - **Peak memory during inference** (RSS measurement)
 - **Wall-clock per token** (throughput on Apple Silicon)
 
@@ -314,7 +318,8 @@ For Friday morning verification — CC has not fetched these in this session. Ea
 |---|---|
 | Thursday evening (2026-05-07): TN-003 landscape + feasibility scout + Friday plan + backlog elevation | **Complete** |
 | Friday morning (2026-05-08): `load_packed_model` rewrite — infrastructure-critical | **Complete (PR #18 merged 10:18:57 AEST)** |
-| Friday early afternoon (in flight): probes A + B (perplexity computation surface; TurboQuant `.tern-model` interface) | **In flight** |
+| Friday early afternoon (executed): probes A + B (perplexity computation surface; TurboQuant `.tern-model` interface) — A: extraction trivial + dataset infra is the work; B: no adapter needed, pipeline is loader-agnostic | **Complete** |
+| Friday early afternoon: probe C (TurboQuant generation-loop integration scope) — open-loop pipeline finding; closed-loop integration banked separately | **Complete (10th probe-before-committing instance)** |
 | Friday afternoon: Measurement infrastructure build (perplexity harness extract; TurboQuant adapter) + first-target measurement (Phi-4) | Planned |
 | Saturday/following: KIVI integration + cluster expansion (gemma4-26b-a4b post-MoE-restacking; hardware-unblocked 30B+ class) + KVQuant calibration + kvtc/SpQt paper identification | Planned |
 
