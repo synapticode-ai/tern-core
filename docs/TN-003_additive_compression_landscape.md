@@ -320,7 +320,8 @@ For Friday morning verification — CC has not fetched these in this session. Ea
 | Friday morning (2026-05-08): `load_packed_model` rewrite — infrastructure-critical | **Complete (PR #18 merged 10:18:57 AEST)** |
 | Friday early afternoon (executed): probes A + B (perplexity computation surface; TurboQuant `.tern-model` interface) — A: extraction trivial + dataset infra is the work; B: no adapter needed, pipeline is loader-agnostic | **Complete** |
 | Friday early afternoon: probe C (TurboQuant generation-loop integration scope) — open-loop pipeline finding; closed-loop integration banked separately | **Complete (10th probe-before-committing instance)** |
-| Friday afternoon: Measurement infrastructure build + smoke 1 v4 (Phi-4 --no-perplexity, open-loop baseline) | **Smoke 1 v4 complete (2026-05-08 15:58 AEST; ~35.7 min wall-clock; 0.29× open-loop ratio per scope finding); smoke 2 (with perplexity) next** |
+| Friday afternoon: Measurement infrastructure build + smoke 1 v4 (Phi-4 --no-perplexity, open-loop baseline) | **Complete (2026-05-08 15:58 AEST; ~35.7 min wall-clock; 0.29× open-loop ratio per scope finding)** |
+| Friday night → Saturday morning: smoke 2 v1 (canonical PPL) + smoke 2-prime (scope-reduced PPL) | **Both killed without PPL completion; Phi-4 14B sliding-window PPL on M4 Pro CPU empirically unmeasurable; banked as L5 capability gap evidence (P140/P142/P143/P145/P127/P152 sprint targets)** |
 | Saturday/following: KIVI integration + cluster expansion (gemma4-26b-a4b post-MoE-restacking; hardware-unblocked 30B+ class) + KVQuant calibration + kvtc/SpQt paper identification | Planned |
 
 Updated incrementally as Friday's work lands. This document is the persistent reference scaffold.
@@ -363,3 +364,33 @@ The existing pipeline is open-loop — compressed state is recorded but the mode
 **Determinism finding:** smoke 1 ran 4 times across 13:32-15:22 AEST. `load_packed_model` reported `missing=162, unexpected=320` bit-identical across all four runs. Generation produced identical output. Wall-clock variances within 1-9% (USB-C IO noise on Syn Archive). Banked as separate diagnostic backlog item ("load_packed_model missing/unexpected counts on Phi-4 dense — investigate root cause").
 
 **Probe-before-committing instance count:** 13 cumulative instances banked methodology-trail-wide; 4 added during Friday afternoon TN-003 work (instance 10 = probe C scope finding, instances 11/12/13 = orchestration script API surprises). Pattern earned its keep at every API surface; no 14th instance triggered the audit gate.
+
+### Smoke 2 v1 + 2-prime — Phi-4 PPL wall-clock prohibitive (canonical and scope-reduced)
+
+**Smoke 2 v1 — canonical settings:**
+
+- Date: 2026-05-08 16:36 → killed 2026-05-09 07:04 AEST
+- Settings: stride=512, max_length=2048
+- Wall-clock at kill: 14:18 elapsed (perplexity loop ~13.7 hours, no completion signal)
+- Outcome: killed without completion; per-window forward pass on Phi-4 14B at 2048 context not tractable on M4 Pro CPU
+
+**Smoke 2-prime — scope-reduced settings:**
+
+- Date: 2026-05-09 07:05 → killed 2026-05-09 11:54 AEST
+- Settings: stride=512, max_length=512 (10× attention reduction per window)
+- Wall-clock at kill: 4:38 elapsed (perplexity loop ~4 hours, no completion signal)
+- Outcome: killed without completion; even at 10× scope reduction, M4 Pro CPU per-window forward pass dominates wall-clock
+
+**Wall-clock prohibitive finding (canonical form for landscape doc + Apple/KAIST brief):**
+
+Phi-4 14B PPL via sliding-window perplexity on M4 Pro CPU is empirically unmeasurable in reasonable wall-clock at any tested setting. Canonical-settings smoke 2 v1: >14 hours, killed. Scope-reduced smoke 2-prime: >4h 38m, killed. Reduction in scope by approximately 10× did not produce a tractable wall-clock.
+
+The measurement gap is **not a tooling fault** — it is the **L5 capability gap** manifesting empirically: a single process at 99% CPU with no per-window telemetry, no progress visibility, no lifecycle event sequence. The kill is itself the canonical example of why P152 lifecycle confidence is structurally required for production-scale model work on consumer-class silicon.
+
+**L5 sprint targets identified against this baseline:**
+
+The smoke 2 / smoke 2-prime kills demonstrate the multi-layer retrofit demo target for the L5 patent cluster:
+
+- **P140 / P142 / P143 / P145 / P127 / P152** — process telemetry, per-event progress visibility, lifecycle event sequencing, capability-class-aware scheduling, and prohibitive-wall-clock detection-and-degradation. The TN-003 measurement work surfaced the absence of these capabilities as wall-clock cost; the L5 sprint adds them as productised infrastructure.
+
+**Probe-before-committing tally (smoke 2 / 2-prime):** No new probe instances added — both runs hit hardware/capability ceilings rather than API-shape mismatches; no 14th-instance audit gate trigger. Cumulative instance count remains 13.

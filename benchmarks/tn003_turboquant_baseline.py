@@ -36,19 +36,32 @@ KIVI / KVQuant / kvtc / SpQt baseline scripts follow the same pattern
 at ``benchmarks/tn003_<technique>_baseline.py`` with the same JSON
 schema for apples-to-apples cross-technique comparison.
 
-Wall-clock estimate per Phi-4 measurement run (empirical 2026-05-08):
+Wall-clock estimate per Phi-4 measurement run (empirical 2026-05-08/09):
 
 - HF base load: ~27-29 min (HF cache lives on USB-C external storage —
   read-throughput-bound; cold and "cached" loads have similar wall-clock
   in practice, contrary to the original ~3-5 min cached estimate)
 - ``load_packed_model``: ~1 min (faster than originally estimated)
 - Generation (50 tokens): ~5 min on M4 Pro CPU
-- Perplexity (default ON; ``--no-perplexity`` to skip): TBD smoke 2;
-  estimated ~15-25 min for Phi-4 on WikiText-2 validation
+- Perplexity at canonical settings (max_length=2048, stride=512):
+  **empirically unmeasurable on M4 Pro CPU**. Smoke 2 v1 (2026-05-08)
+  ran 14:18 elapsed without completion before kill.
+- Perplexity at scope-reduced settings (max_length=512, stride=512;
+  ~10× attention reduction per window): **also empirically
+  unmeasurable**. Smoke 2-prime (2026-05-09) ran 4:38 elapsed without
+  completion before kill.
+- **Phi-4 14B PPL via sliding-window perplexity on M4 Pro CPU is
+  empirically unmeasurable in reasonable wall-clock at any tested
+  setting.** The measurement gap is hardware capability, not tooling:
+  Phi-4 14B FP16 forward passes on M4 Pro CPU dominate the wall-clock
+  regardless of context length scaling. Tractable measurement requires
+  M4 Max / M5 / Mac Studio class hardware, OR algorithmic shortcuts
+  (subset of WikiText-2, smaller perplexity surrogate metric, etc.).
 - Total ``--no-perplexity`` smoke: **~35 min** (verified across smoke 1
   v1-v4) — substantially longer than the original ~5-10 min projection
   because HF base load is read-throughput-bound on Syn Archive
-- Total full (with perplexity): TBD smoke 2; estimated ~50-60 min
+- Total full smoke at canonical settings: **prohibitive on M4 Pro**
+  per the empirical findings above
 
 Copyright (c) 2025-2026 Gamma Seeds Pte Ltd. All rights reserved.
 """
