@@ -148,43 +148,65 @@ def _extract_kv_pairs(past_key_values):
 class IncrementalTQCompressor:
     """Incrementally compresses KV cache vectors via TurboQuant.
 
-    Initialises rotation and QJL matrices once per layer×head, then
-    encodes only newly-appended vectors on each call to `append`.
+    Per-(layer, head) rotation + QJL state is built lazily on first
+    encode, keyed by the layer's observed head_dim. This supports
+    heterogeneous attention architectures (e.g. Gemma 4's alternating
+    sliding_attention head_dim=256 / full_attention head_dim=512
+    layers) where a single uniform TurboQuantConfig would fail at the
+    first off-shape layer.
     """
 
-    def __init__(self, n_layers: int, n_heads: int, head_dim: int, device="cpu"):
+    def __init__(self, n_layers=None, n_heads=None, head_dim=None, device="cpu"):
+        # n_layers/n_heads/head_dim retained as legacy positional hints
+        # for back-compat with prior callers; ignored — state is built
+        # lazily from the observed cache shapes at first encode.
         sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
+        self.device = torch.device(device)
+
+        # Per-head_dim TurboQuantConfig (codebook + d_padded etc.)
+        self._configs: dict[int, object] = {}
+        # rotations[head_dim][(layer_idx, head_idx)] = rotation
+        self._rotations: dict[int, dict[tuple[int, int], object]] = {}
+        self._qjl: dict[int, dict[tuple[int, int], torch.Tensor]] = {}
+        self._mixed: dict[int, dict[tuple[int, int], object]] = {}
+
+        # compressed[(layer_idx, head_idx)] = list of (k_c, v_c)
+        self.compressed: dict[tuple[int, int], list] = {}
+        # head_dim_layers[head_dim] = set of layer_idx seen for this dim
+        self.head_dim_layers: dict[int, set[int]] = {}
+        self.seq_len = 0
+
+    def _ensure_config(self, head_dim: int) -> None:
+        if head_dim in self._configs:
+            return
         from src.cache import TurboQuantConfig
-
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.config = TurboQuantConfig(
+        self._configs[head_dim] = TurboQuantConfig(
             d=head_dim, b_mse=3,
-            device=torch.device(device), mixed_precision=True,
+            device=self.device, mixed_precision=True,
         )
-        # Pre-build per-layer, per-head rotation + QJL state
-        self.rotations = []
-        self.qjl_matrices = []
-        self.mixed_cfgs = []
-        for l in range(n_layers):
-            r_layer, s_layer, m_layer = [], [], []
-            for h in range(n_heads):
-                r_layer.append(self.config.make_rotation(l, h))
-                s_layer.append(self.config.make_qjl_matrix(l, h))
-                m_layer.append(self.config.get_mixed_config(l, h))
-            self.rotations.append(r_layer)
-            self.qjl_matrices.append(s_layer)
-            self.mixed_cfgs.append(m_layer)
+        self._rotations[head_dim] = {}
+        self._qjl[head_dim] = {}
+        self._mixed[head_dim] = {}
+        self.head_dim_layers[head_dim] = set()
 
-        # compressed[layer][head] = list of (k_compressed, v_compressed)
-        self.compressed = [[[] for _ in range(n_heads)] for _ in range(n_layers)]
-        self.seq_len = 0  # number of positions already compressed
+    def _ensure_state(self, head_dim: int, l: int, h: int) -> None:
+        self._ensure_config(head_dim)
+        key = (l, h)
+        if key not in self._rotations[head_dim]:
+            cfg = self._configs[head_dim]
+            self._rotations[head_dim][key] = cfg.make_rotation(l, h)
+            self._qjl[head_dim][key] = cfg.make_qjl_matrix(l, h)
+            self._mixed[head_dim][key] = cfg.get_mixed_config(l, h)
+            self.head_dim_layers[head_dim].add(l)
 
     def append(self, past_key_values, *, encode_from: int | None = None):
         """Encode positions [encode_from:] from the live KV cache.
 
         If encode_from is None, encodes from self.seq_len (i.e. only new
-        positions since the last call).
+        positions since the last call). Per-layer head_dim is read from
+        each layer's K tensor; rotation state is materialised on demand
+        for any (head_dim, layer, head) combination seen for the first
+        time.
         """
         from src.cache import turboquant_encode_internal
 
@@ -194,27 +216,40 @@ class IncrementalTQCompressor:
         if start >= total_seq:
             return  # nothing new
 
-        for l in range(self.n_layers):
-            keys = kv_pairs[l][0]    # (1, n_heads, seq_len, head_dim)
-            values = kv_pairs[l][1]
-            for h in range(self.n_heads):
-                # Slice only the new positions: (new_tokens, head_dim)
+        for l, (keys, values) in enumerate(kv_pairs):
+            # (1, n_kv_heads, seq_len, head_dim) — per-layer head_dim
+            head_dim = int(keys.shape[-1])
+            n_kv_heads = int(keys.shape[1])
+            self._ensure_config(head_dim)
+            cfg = self._configs[head_dim]
+            for h in range(n_kv_heads):
+                self._ensure_state(head_dim, l, h)
                 k_new = keys[0, h, start:total_seq].float()
                 v_new = values[0, h, start:total_seq].float()
 
-                rotation = self.rotations[l][h]
-                S = self.qjl_matrices[l][h]
-                mixed = self.mixed_cfgs[l][h]
+                rotation = self._rotations[head_dim][(l, h)]
+                S = self._qjl[head_dim][(l, h)]
+                mixed = self._mixed[head_dim][(l, h)]
 
                 k_c = turboquant_encode_internal(
-                    k_new, self.config.codebook, rotation, S, mixed=mixed,
+                    k_new, cfg.codebook, rotation, S, mixed=mixed,
                 )
                 v_c = turboquant_encode_internal(
-                    v_new, self.config.codebook, rotation, S, mixed=mixed,
+                    v_new, cfg.codebook, rotation, S, mixed=mixed,
                 )
-                self.compressed[l][h].append((k_c, v_c))
+                self.compressed.setdefault((l, h), []).append((k_c, v_c))
 
         self.seq_len = total_seq
+
+    def summary(self) -> dict:
+        """Per-head_dim layer counts; for row-output breakdown."""
+        return {
+            int(d): {
+                "n_layers": len(layers),
+                "layer_idxs": sorted(int(x) for x in layers),
+            }
+            for d, layers in self.head_dim_layers.items()
+        }
 
 
 def generate_streaming_turboquant(
