@@ -38,12 +38,18 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from terncore.mixed_precision import MixedPrecisionConverter
+from terncore.tern_model import TernModelReader, GEMMA4_MULTIMODAL_TRANSFORMERS_5_5
 
 # Reuse the proven TurboQuant streaming driver from tern_infer
 from tern_infer import (
     _extract_kv_pairs,
     IncrementalTQCompressor,
 )
+
+
+_KEY_MAPPING_PRESETS = {
+    "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5": GEMMA4_MULTIMODAL_TRANSFORMERS_5_5,
+}
 
 
 def _rss_mb() -> float:
@@ -417,9 +423,216 @@ def _resolve_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
+class _TernModelStubReport:
+    """Mirror MixedPrecisionConverter.ConversionReport shape from manifest."""
+
+    def __init__(self, reader: "TernModelReader", meta_json: dict | None):
+        self.total_layers = reader.header["num_layers"]
+        self.converted_layers = reader.header["num_ternary"]
+        self.skipped_layers = reader.header["num_protected"]
+
+        if meta_json is not None and "total_params" in meta_json:
+            self.total_params = int(meta_json["total_params"])
+            self.ternary_params = int(meta_json.get("ternary_params", 0))
+            self.compression_ratio = float(meta_json.get("compression_vs_fp16", 0.0))
+            self.original_size_mb = self.total_params * 2 / (1024 * 1024)
+            self.ternary_size_mb = float(meta_json.get("tern_pkg_size_mb", 0.0))
+        else:
+            ternary_params = 0
+            total_params = 0
+            for entry in reader.manifest["layers"]:
+                shape = entry.get("shape") or []
+                n = 1
+                for d in shape:
+                    n *= int(d)
+                if entry.get("stacked_parent") is not None:
+                    n *= int(entry.get("stack_total", 1)) // max(1, int(entry.get("stack_total", 1)))
+                total_params += n
+                if entry.get("dtype") == "ternary2":
+                    ternary_params += n
+            self.total_params = total_params
+            self.ternary_params = ternary_params
+            self.original_size_mb = total_params * 2 / (1024 * 1024)
+            self.ternary_size_mb = reader.path.stat().st_size / (1024 * 1024)
+            self.compression_ratio = (
+                self.original_size_mb / self.ternary_size_mb
+                if self.ternary_size_mb > 0 else 0.0
+            )
+
+
+def _resolve_tern_model_id(reader: "TernModelReader", tern_path: Path, override: str | None) -> str:
+    """Resolve HF model_id for tokenizer + arch. Order: --tokenizer > manifest > sibling meta.json."""
+    if override:
+        return override
+    md = reader.manifest.get("model_metadata", {})
+    if md.get("source"):
+        return md["source"]
+    for candidate in (tern_path.parent / "meta.json", tern_path.parent.parent / "meta.json"):
+        if candidate.exists():
+            with open(candidate) as f:
+                meta = json.load(f)
+            mid = meta.get("model_id_canonical") or meta.get("model_id")
+            if mid:
+                return mid
+    raise SystemExit(
+        "[bench] no tokenizer/model_id resolvable from .tern-model manifest "
+        "(model_metadata.source absent) or sibling meta.json. Pass --tokenizer "
+        "<HF_MODEL_ID> explicitly."
+    )
+
+
+def _resolve_key_mapping(arg_value: str, reader: "TernModelReader", model: "torch.nn.Module"):
+    """Translate --key-mapping flag into a dict (or None). 'auto' probes structure."""
+    if arg_value in ("none", "None", ""):
+        return None, None
+    if arg_value != "auto":
+        if arg_value not in _KEY_MAPPING_PRESETS:
+            raise SystemExit(
+                f"[bench] unknown key_mapping preset {arg_value!r}; "
+                f"known: {sorted(_KEY_MAPPING_PRESETS) + ['auto', 'none']}"
+            )
+        return _KEY_MAPPING_PRESETS[arg_value], arg_value
+    # auto-detect: gemma 4 multimodal layout has model.language_model.* on the
+    # HF skeleton but manifest entries packed against pre-5.5 layout omit it
+    inner = getattr(model, "model", None)
+    if inner is not None and hasattr(inner, "language_model"):
+        first = reader.manifest["layers"][0]["name"] if reader.manifest["layers"] else ""
+        if first.startswith("model.embed_tokens.") or first.startswith("model.layers."):
+            return _KEY_MAPPING_PRESETS["GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"], "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"
+    return None, None
+
+
+def _load_via_tern_model(args, dtype, device, rss_start):
+    """Load a pre-compressed .tern-model via TernModelReader.load_packed_model.
+
+    Returns the same fields the FP16+MPC path produces, with NaN/stub values
+    where the compressed-source path has no analogue (e.g. ppl_fp baseline,
+    MPC convert timing).
+    """
+    from transformers import AutoTokenizer, AutoConfig
+    import transformers as tx
+    from accelerate import init_empty_weights
+
+    tern_path = Path(args.tern_model).resolve()
+    if not tern_path.exists():
+        raise SystemExit(f"[bench] --tern-model path does not exist: {tern_path}")
+    print(f"[bench] reading {tern_path.name}...")
+    reader = TernModelReader(str(tern_path))
+
+    meta_json: dict | None = None
+    for candidate in (tern_path.parent / "meta.json", tern_path.parent.parent / "meta.json"):
+        if candidate.exists():
+            with open(candidate) as f:
+                meta_json = json.load(f)
+            break
+
+    model_id = _resolve_tern_model_id(reader, tern_path, args.tokenizer)
+    print(f"[bench] model_id={model_id}")
+
+    model_class_name = _resolve_model_class(model_id, args.model_class)
+    cls = getattr(tx, model_class_name)
+    print(f"[bench] dtype={args.dtype}  device={device}  model_class={model_class_name}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    config = AutoConfig.from_pretrained(model_id)
+
+    t_load0 = time.perf_counter()
+    print("[bench] meta-init HF skeleton (no weight allocation)...")
+    with init_empty_weights():
+        if hasattr(cls, "_from_config"):
+            model = cls._from_config(config, dtype=dtype)
+        else:
+            model = cls.from_config(config, dtype=dtype)
+    rss_after_init = _rss_mb()
+    print(f"[bench] meta-init done  RSS={rss_after_init:.0f} MiB  Δ={rss_after_init-rss_start:.0f}")
+
+    key_mapping, key_mapping_label = _resolve_key_mapping(args.key_mapping, reader, model)
+    if key_mapping_label:
+        print(f"[bench] key_mapping={key_mapping_label}")
+    else:
+        print("[bench] key_mapping=none")
+
+    print("[bench] load_packed_model: installing PackedTernaryLinear in place...")
+    missing, unexpected = reader.load_packed_model(model, key_mapping=key_mapping)
+
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+    meta_params_left = [n for n, p in model.named_parameters() if p.is_meta]
+    meta_bufs_left = [n for n, b in model.named_buffers() if b.is_meta]
+    if meta_params_left or meta_bufs_left:
+        raise SystemExit(
+            f"[bench] post-load: {len(meta_params_left)} meta parameters and "
+            f"{len(meta_bufs_left)} meta buffers remain unmaterialised. "
+            f"Forward pass would produce garbage. First few: "
+            f"params={meta_params_left[:5]} bufs={meta_bufs_left[:5]}"
+        )
+
+    t_load = time.perf_counter() - t_load0
+    rss_after_load = _rss_mb()
+    print(
+        f"[bench] load={t_load:.1f}s  RSS={rss_after_load:.0f} MiB  Δ={rss_after_load-rss_start:.0f}  "
+        f"missing={len(missing)} unexpected={len(unexpected)}"
+    )
+
+    if device.type != "cpu":
+        try:
+            model = model.to(device)
+        except Exception as e:
+            print(f"[bench] WARNING: .to({device}) failed ({type(e).__name__}: {e}); falling back to CPU")
+            device = torch.device("cpu")
+    model.eval()
+
+    report = _TernModelStubReport(reader, meta_json)
+    print(
+        f"[bench] stub report from manifest: "
+        f"converted={report.converted_layers}/{report.total_layers} "
+        f"compression={report.compression_ratio:.2f}x"
+    )
+
+    # PPL baseline does not exist for compressed-source path: model is already ternary
+    ppl_fp = float("nan")
+    t_conv = 0.0
+    rss_after_conv = rss_after_load
+
+    return (
+        model, tokenizer, model_id, model_class_name,
+        t_load, rss_after_load, report, ppl_fp, t_conv, rss_after_conv,
+        str(tern_path), key_mapping_label, missing, unexpected,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="HuggingFace model id")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--model", help="HuggingFace model id (FP16 path: load + MPC convert on-the-fly)")
+    src.add_argument(
+        "--tern-model",
+        help=(
+            "Path to a pre-compressed .tern-model artefact. Skips HF FP16 load "
+            "and MixedPrecisionConverter; routes through TernModelReader."
+            "load_packed_model for zero-copy PackedTernaryLinear installation."
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer",
+        help=(
+            "HF tokenizer id override. Used in --tern-model mode when the "
+            "manifest's model_metadata.source field is absent or wrong."
+        ),
+    )
+    parser.add_argument(
+        "--key-mapping", default="auto",
+        help=(
+            "Key-mapping preset for load_packed_model in --tern-model mode. "
+            "'auto' (default) probes manifest entry shape vs model layout and "
+            "applies GEMMA4_MULTIMODAL_TRANSFORMERS_5_5 when the model exposes "
+            "model.language_model. 'none' disables mapping. Or pass an "
+            "explicit preset name."
+        ),
+    )
     parser.add_argument("--prompt", default="The future of computing lies in")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--threshold", type=float, default=0.7)
@@ -449,52 +662,62 @@ def main() -> int:
 
     dtype = _DTYPE_MAP[args.dtype]
     device = _resolve_device(args.device)
-    model_class_name = _resolve_model_class(args.model, args.model_class)
-    print(f"[bench] dtype={args.dtype}  device={device}  model_class={model_class_name}")
 
-    t_load0 = time.perf_counter()
-    from transformers import AutoTokenizer
-    import transformers as tx
-    cls = getattr(tx, model_class_name)
-    print(f"[bench] loading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = cls.from_pretrained(args.model, dtype=dtype)
-    if device.type != "cpu":
-        try:
-            model = model.to(device)
-        except Exception as e:
-            print(f"[bench] WARNING: .to({device}) failed ({type(e).__name__}: {e}); falling back to CPU")
-            device = torch.device("cpu")
-    model.eval()
-    t_load = time.perf_counter() - t_load0
-    rss_after_load = _rss_mb()
-    print(f"[bench] load={t_load:.1f}s  RSS={rss_after_load:.0f} MiB  Δ={rss_after_load-rss_start:.0f}")
+    if args.tern_model is not None:
+        (
+            model, tokenizer, model_id, model_class_name,
+            t_load, rss_after_load, report, ppl_fp, t_conv, rss_after_conv,
+            tern_model_path, key_mapping_used, missing_keys, unexpected_keys,
+        ) = _load_via_tern_model(args, dtype, device, rss_start)
+    else:
+        model_id = args.model
+        model_class_name = _resolve_model_class(args.model, args.model_class)
+        print(f"[bench] dtype={args.dtype}  device={device}  model_class={model_class_name}")
 
-    # PPL baseline (on canonical short passages)
-    print(f"[bench] measuring baseline PPL (dtype={args.dtype})...")
-    t_ppl0 = time.perf_counter()
-    ppl_fp = _measure_ppl(model, tokenizer, _PPL_PASSAGES, device=device)
-    print(f"[bench] PPL_baseline={ppl_fp:.4f} ({time.perf_counter()-t_ppl0:.1f}s)")
+        t_load0 = time.perf_counter()
+        from transformers import AutoTokenizer
+        import transformers as tx
+        cls = getattr(tx, model_class_name)
+        print(f"[bench] loading {args.model}...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = cls.from_pretrained(args.model, dtype=dtype)
+        if device.type != "cpu":
+            try:
+                model = model.to(device)
+            except Exception as e:
+                print(f"[bench] WARNING: .to({device}) failed ({type(e).__name__}: {e}); falling back to CPU")
+                device = torch.device("cpu")
+        model.eval()
+        t_load = time.perf_counter() - t_load0
+        rss_after_load = _rss_mb()
+        print(f"[bench] load={t_load:.1f}s  RSS={rss_after_load:.0f} MiB  Δ={rss_after_load-rss_start:.0f}")
 
-    # MPC convert
-    print(f"[bench] converting via MixedPrecisionConverter(threshold={args.threshold}, auto={not args.no_autoscan})...")
-    t_conv0 = time.perf_counter()
-    converter = MixedPrecisionConverter(
-        threshold=args.threshold,
-        auto=not args.no_autoscan,
-    )
-    # When auto=False, no model_id needed; when auto=True, pass model_id to trigger autoscan
-    convert_kwargs = {} if args.no_autoscan else {"model_id": args.model}
-    report = converter.convert(model, **convert_kwargs)
-    t_conv = time.perf_counter() - t_conv0
-    rss_after_conv = _rss_mb()
-    print(
-        f"[bench] convert={t_conv:.1f}s  RSS={rss_after_conv:.0f} MiB"
-        f"  converted={report.converted_layers}/{report.total_layers}"
-        f"  compression={report.compression_ratio:.2f}x"
-    )
+        print(f"[bench] measuring baseline PPL (dtype={args.dtype})...")
+        t_ppl0 = time.perf_counter()
+        ppl_fp = _measure_ppl(model, tokenizer, _PPL_PASSAGES, device=device)
+        print(f"[bench] PPL_baseline={ppl_fp:.4f} ({time.perf_counter()-t_ppl0:.1f}s)")
+
+        print(f"[bench] converting via MixedPrecisionConverter(threshold={args.threshold}, auto={not args.no_autoscan})...")
+        t_conv0 = time.perf_counter()
+        converter = MixedPrecisionConverter(
+            threshold=args.threshold,
+            auto=not args.no_autoscan,
+        )
+        convert_kwargs = {} if args.no_autoscan else {"model_id": args.model}
+        report = converter.convert(model, **convert_kwargs)
+        t_conv = time.perf_counter() - t_conv0
+        rss_after_conv = _rss_mb()
+        print(
+            f"[bench] convert={t_conv:.1f}s  RSS={rss_after_conv:.0f} MiB"
+            f"  converted={report.converted_layers}/{report.total_layers}"
+            f"  compression={report.compression_ratio:.2f}x"
+        )
+        tern_model_path = None
+        key_mapping_used = None
+        missing_keys = []
+        unexpected_keys = []
 
     # Baseline generation (uncompressed KV cache)
     print("[bench] baseline generation (uncompressed KV)...")
@@ -534,7 +757,8 @@ def main() -> int:
     )
 
     iso = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    slug = args.model.split("/")[-1].replace("-", "_").replace(".", "_").lower()
+    slug_source = model_id if args.tern_model is None else f"{model_id}_ternpacked"
+    slug = slug_source.split("/")[-1].replace("-", "_").replace(".", "_").lower()
     out_path = Path(args.out_dir) / f"tq_bench_results_{slug}_{iso}.json"
 
     # Per-head_dim compression breakdown — in-memory (existing)
@@ -563,8 +787,15 @@ def main() -> int:
         "benchmark": "TurboQuant KV cache compression",
         "hardware": "Apple M4 Pro",
         "date_utc": iso,
-        "model": args.model,
+        "model": model_id,
         "model_class": model_class_name,
+        "source_path": tern_model_path,
+        "source_kind": "tern_model_packed" if args.tern_model is not None else "hf_fp16_plus_mpc",
+        "key_mapping": key_mapping_used,
+        "load_packed_keys": {
+            "missing": len(missing_keys),
+            "unexpected": len(unexpected_keys),
+        },
         "method": "incremental TurboQuant (QJL + rotation, mixed-precision 3-bit MSE) — per-head_dim lazy compressor",
         "description": "Measures KV cache compression via TurboQuant hook during autoregressive generation. Prefill encodes full prompt KV in one batch; each decode step encodes only the new KV pair. Per-layer head_dim detected lazily — supports heterogeneous attention (e.g. Gemma 4 sliding/full mix).",
         "config": {
