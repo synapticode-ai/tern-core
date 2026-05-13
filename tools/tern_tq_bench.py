@@ -493,27 +493,23 @@ def _resolve_key_mapping(arg_value: str, reader: "TernModelReader", model: "torc
                 f"known: {sorted(_KEY_MAPPING_PRESETS) + ['auto', 'none']}"
             )
         return _KEY_MAPPING_PRESETS[arg_value], arg_value
-    # auto-detect Gemma 4 multimodal: HF skeleton exposes model.language_model.*
-    # while pre-5.5-packed manifests use either model.<x>. (e4b/26b-a4b style)
-    # or bare vision_tower./embed_vision./audio_tower. (31b mlx-source style)
+    # auto-detect Gemma 4 multimodal: HF skeleton at transformers 5.5+
+    # exposes model.language_model.* while pre-5.5-packed manifests use
+    # model.<x>. (e4b/26b-a4b) or bare vision_tower./embed_vision./
+    # audio_tower. prefixes (31b mlx-source). Defer applying the preset
+    # only when the manifest is already packed for the post-5.5 layout
+    # (would double-translate to model.language_model.language_model.*).
     inner = getattr(model, "model", None)
     if inner is not None and hasattr(inner, "language_model"):
-        manifest_prefixes = {
-            l["name"].split(".", 1)[0] + "." for l in reader.manifest["layers"][:50]
-        }
-        gemma4_signals = {
-            "model.embed_tokens.",
-            "model.layers.",
-            "vision_tower.",
-            "embed_vision.",
-            "audio_tower.",
-        }
-        if manifest_prefixes & {"vision_tower.", "embed_vision.", "audio_tower."}:
-            return _KEY_MAPPING_PRESETS["GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"], "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"
-        for entry in reader.manifest["layers"][:5]:
-            n = entry["name"]
-            if n.startswith("model.embed_tokens.") or n.startswith("model.layers."):
-                return _KEY_MAPPING_PRESETS["GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"], "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"
+        already_post_5_5 = any(
+            l["name"].startswith("model.language_model.")
+            for l in reader.manifest["layers"]
+        )
+        if not already_post_5_5:
+            return (
+                _KEY_MAPPING_PRESETS["GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"],
+                "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5",
+            )
     return None, None
 
 
