@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import io
 import json
 import math
 import resource
@@ -492,13 +493,27 @@ def _resolve_key_mapping(arg_value: str, reader: "TernModelReader", model: "torc
                 f"known: {sorted(_KEY_MAPPING_PRESETS) + ['auto', 'none']}"
             )
         return _KEY_MAPPING_PRESETS[arg_value], arg_value
-    # auto-detect: gemma 4 multimodal layout has model.language_model.* on the
-    # HF skeleton but manifest entries packed against pre-5.5 layout omit it
+    # auto-detect Gemma 4 multimodal: HF skeleton exposes model.language_model.*
+    # while pre-5.5-packed manifests use either model.<x>. (e4b/26b-a4b style)
+    # or bare vision_tower./embed_vision./audio_tower. (31b mlx-source style)
     inner = getattr(model, "model", None)
     if inner is not None and hasattr(inner, "language_model"):
-        first = reader.manifest["layers"][0]["name"] if reader.manifest["layers"] else ""
-        if first.startswith("model.embed_tokens.") or first.startswith("model.layers."):
+        manifest_prefixes = {
+            l["name"].split(".", 1)[0] + "." for l in reader.manifest["layers"][:50]
+        }
+        gemma4_signals = {
+            "model.embed_tokens.",
+            "model.layers.",
+            "vision_tower.",
+            "embed_vision.",
+            "audio_tower.",
+        }
+        if manifest_prefixes & {"vision_tower.", "embed_vision.", "audio_tower."}:
             return _KEY_MAPPING_PRESETS["GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"], "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"
+        for entry in reader.manifest["layers"][:5]:
+            n = entry["name"]
+            if n.startswith("model.embed_tokens.") or n.startswith("model.layers."):
+                return _KEY_MAPPING_PRESETS["GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"], "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5"
     return None, None
 
 
@@ -529,15 +544,20 @@ def _load_via_tern_model(args, dtype, device, rss_start):
     model_id = _resolve_tern_model_id(reader, tern_path, args.tokenizer)
     print(f"[bench] model_id={model_id}")
 
-    model_class_name = _resolve_model_class(model_id, args.model_class)
-    cls = getattr(tx, model_class_name)
-    print(f"[bench] dtype={args.dtype}  device={device}  model_class={model_class_name}")
-
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     config = AutoConfig.from_pretrained(model_id)
+
+    if args.model_class != "auto":
+        model_class_name = args.model_class
+    elif config.architectures and hasattr(tx, config.architectures[0]):
+        model_class_name = config.architectures[0]
+    else:
+        model_class_name = _resolve_model_class(model_id, args.model_class)
+    cls = getattr(tx, model_class_name)
+    print(f"[bench] dtype={args.dtype}  device={device}  model_class={model_class_name}")
 
     t_load0 = time.perf_counter()
     print("[bench] meta-init HF skeleton (no weight allocation)...")
@@ -605,6 +625,11 @@ def _load_via_tern_model(args, dtype, device, rss_start):
 
 
 def main() -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, io.UnsupportedOperation):
+        pass
+
     parser = argparse.ArgumentParser()
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--model", help="HuggingFace model id (FP16 path: load + MPC convert on-the-fly)")
