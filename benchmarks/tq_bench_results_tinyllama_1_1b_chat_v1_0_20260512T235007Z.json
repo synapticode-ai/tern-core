@@ -1,0 +1,87 @@
+{
+  "benchmark": "TurboQuant KV cache compression",
+  "hardware": "Apple M4 Pro",
+  "date_utc": "20260512T235007Z",
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "model_class": "AutoModelForCausalLM",
+  "method": "incremental TurboQuant (QJL + rotation, mixed-precision 3-bit MSE) \u2014 per-head_dim lazy compressor",
+  "description": "Measures KV cache compression via TurboQuant hook during autoregressive generation. Prefill encodes full prompt KV in one batch; each decode step encodes only the new KV pair. Per-layer head_dim detected lazily \u2014 supports heterogeneous attention (e.g. Gemma 4 sliding/full mix).",
+  "config": {
+    "threshold": 0.7,
+    "autoscan": false,
+    "prompt": "The future of computing lies in",
+    "max_tokens": 100,
+    "dtype": "fp32",
+    "device": "cpu",
+    "b_mse": 3,
+    "mixed_precision": true
+  },
+  "results": {
+    "kv_cache_compression_ratio_aggregate": 0.38758855981652596,
+    "per_head_dim_breakdown": {
+      "64": {
+        "layer_count": 22,
+        "uncompressed_mb": 4.5546875,
+        "compressed_mb": 11.751346588134766,
+        "compression_ratio": 0.38758855981652596
+      }
+    },
+    "packed_bits_compression_ratio_aggregate": 2.1975340907626872,
+    "packed_bits_per_head_dim_breakdown": {
+      "64": {
+        "layer_count": 22,
+        "uncompressed_mb": 4.5546875,
+        "packed_mb_opt_a": 2.0726356506347656,
+        "compression_ratio_opt_a": 2.1975340907626872
+      }
+    },
+    "packed_bits_compression_ratio_excluding_regenerable_shared": 6.736195972896885,
+    "packed_bits_per_head_dim_breakdown_regenerable_excluded": {
+      "64": {
+        "layer_count": 22,
+        "uncompressed_mb": 4.5546875,
+        "packed_mb_opt_b": 0.6761512756347656,
+        "compression_ratio_opt_b": 6.736195972896885
+      }
+    },
+    "bits_per_slot_formula": "d \u00d7 (b_mse + 1) / 8 + 6 bytes \u2014 PQ b_mse-bit indices + QJL 1-bit signs + PQ FP16 norm (2B) + QJL FP32 r_norm (4B)",
+    "regenerable_shared_includes": [
+      "qjl.S (d \u00d7 d FP32)",
+      "PQ rotation signs (d FP32)"
+    ],
+    "prefill_overhead_ms": 75.04816700384254,
+    "per_token_encode_ms": 22.890958293268195,
+    "peak_memory_uncompressed_mb": 4.5546875,
+    "peak_memory_compressed_mb": 11.751346588134766,
+    "perplexity_baseline": 103.10937077364251,
+    "perplexity_with_ternary_weights": 111289.36219959053,
+    "perplexity_delta_pct": 107833.31524047961,
+    "ppl_note": "PPL_baseline measured on a short canonical passage set (5 sentences), single forward pass each \u2014 not comparable to WikiText-2 sliding-window perplexity in tq_bench_results.json. ternary PPL reflects weight-only compression impact; the TurboQuant compressor encodes KV state but does not route back into forward in this harness. For Gemma 4 specifically, see Gemma-4-PPL-methodology backlog item \u2014 baseline numbers may be pathological without proper logit-softcap / chat-template preprocessing."
+  },
+  "tokens": {
+    "baseline_tps": 1.8949275765631755,
+    "turboquant_tps": 1.7894427814754976,
+    "tokens_generated_baseline": 100,
+    "tokens_generated_tq": 100
+  },
+  "memory_mib": {
+    "rss_start": 182.171875,
+    "rss_after_load": 6767.0,
+    "rss_after_convert": 8380.75,
+    "rss_peak": 10427.921875
+  },
+  "conversion_report": {
+    "total_layers": 155,
+    "converted_layers": 154,
+    "skipped_layers": 1,
+    "total_params": 1034420224,
+    "ternary_params": 968884224,
+    "compression_ratio": 5.542134831460674,
+    "original_size_mb": 1973.0,
+    "ternary_size_mb": 356.0
+  },
+  "timings_s": {
+    "model_load": 2.1704362079981365,
+    "convert": 7.671931874996517
+  }
+}

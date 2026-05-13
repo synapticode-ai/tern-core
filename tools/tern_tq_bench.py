@@ -122,6 +122,98 @@ def _compressed_bytes(compressor: IncrementalTQCompressor) -> int:
     return sum(_compressed_bytes_per_head_dim(compressor).values())
 
 
+def _slot_packed_bytes(d_padded: int, b_mse: int = 3) -> int:
+    """Theoretical packed bytes per k-slot or v-slot:
+       d × (b_mse + 1) / 8 + 6
+    Composition (per the TurboQuantCompressed = PQ + QJL structure):
+      d × b_mse / 8   bytes for PQ indices packed to b_mse bits per coord
+      d × 1     / 8   bytes for QJL signs packed to 1 bit per coord
+      2 bytes         for PQ FP16 norm (single value per slot)
+      4 bytes         for QJL FP32 r_norm (single value per slot)
+    """
+    return (d_padded * (b_mse + 1)) // 8 + 6
+
+
+def _shared_overhead_per_lh_bytes(d_padded: int) -> int:
+    """qjl.S (d × d FP32) + PQ rotation signs (d FP32). Regenerable
+    from (layer_idx, head_idx, salt) seed — see OPT-B which excludes."""
+    return d_padded * d_padded * 4 + d_padded * 4
+
+
+def _codebook_bytes_for_head_dim(compressor: IncrementalTQCompressor, head_dim: int) -> int:
+    """Sum tensor bytes inside the shared Lloyd-Max codebook for a head_dim."""
+    cfg = compressor._configs.get(head_dim)
+    if cfg is None or cfg.codebook is None:
+        return 0
+    cb = cfg.codebook
+    total = 0
+    for attr in vars(cb).values():
+        if isinstance(attr, torch.Tensor):
+            total += attr.element_size() * attr.numel()
+    return total
+
+
+def _slots_per_head_dim(compressor: IncrementalTQCompressor) -> dict[int, dict[tuple[int, int], int]]:
+    """Map head_dim → {(l, h) → total slot count summed across records}.
+    Each (l, h) contributes the same count for k and v, so callers
+    multiply ×2 to count both sides."""
+    layer_to_dim: dict[int, int] = {}
+    for d, layers in compressor.head_dim_layers.items():
+        for l in layers:
+            layer_to_dim[l] = d
+    out: dict[int, dict[tuple[int, int], int]] = {}
+    for (l, h), records in compressor.compressed.items():
+        d = layer_to_dim.get(l, -1)
+        slots = 0
+        for k_c, _v_c in records:
+            # k_c.pq.indices shape is (n_new, d_padded); n_new = positions
+            # encoded in this record.
+            idx = k_c.pq.indices
+            if idx is not None:
+                slots += idx.shape[0]
+        out.setdefault(d, {})[(l, h)] = slots
+    return out
+
+
+def _packed_bytes_per_head_dim_opt_a(
+    compressor: IncrementalTQCompressor, b_mse: int = 3
+) -> dict[int, int]:
+    """OPT-A — conservative. Counts qjl.S + PQ rotation as stored bulk."""
+    slots_map = _slots_per_head_dim(compressor)
+    out: dict[int, int] = {}
+    for d, lh_slots in slots_map.items():
+        cfg = compressor._configs.get(d)
+        d_padded = cfg.d_padded if cfg is not None else d
+        per_slot = _slot_packed_bytes(d_padded, b_mse)
+        shared_per_lh = _shared_overhead_per_lh_bytes(d_padded)
+        partition_bytes = 0
+        for (l, h), n_slots in lh_slots.items():
+            partition_bytes += per_slot * n_slots * 2  # ×2 for k + v
+            partition_bytes += shared_per_lh
+        partition_bytes += _codebook_bytes_for_head_dim(compressor, d)
+        out[d] = partition_bytes
+    return out
+
+
+def _packed_bytes_per_head_dim_opt_b(
+    compressor: IncrementalTQCompressor, b_mse: int = 3
+) -> dict[int, int]:
+    """OPT-B — deployment-relevant. Excludes regenerable shared overhead
+    (qjl.S, PQ rotation) — both deterministic from seeded RNG."""
+    slots_map = _slots_per_head_dim(compressor)
+    out: dict[int, int] = {}
+    for d, lh_slots in slots_map.items():
+        cfg = compressor._configs.get(d)
+        d_padded = cfg.d_padded if cfg is not None else d
+        per_slot = _slot_packed_bytes(d_padded, b_mse)
+        partition_bytes = 0
+        for (l, h), n_slots in lh_slots.items():
+            partition_bytes += per_slot * n_slots * 2  # ×2 for k + v
+        partition_bytes += _codebook_bytes_for_head_dim(compressor, d)
+        out[d] = partition_bytes
+    return out
+
+
 def _measure_ppl(model, tokenizer, passages: list[str], device=None) -> float:
     """Average per-token NLL over short passages, exponentiated.
 
@@ -200,6 +292,37 @@ def _generate_baseline(model, tokenizer, prompt: str, max_tokens: int, device):
     }
 
 
+def _compute_packed_breakdown(
+    compressor: IncrementalTQCompressor,
+    base_per_head_dim_mb: dict[int, float],
+    b_mse: int = 3,
+) -> dict:
+    """Build per-head_dim packed-bits breakdown rows for OPT-A and OPT-B."""
+    opt_a = _packed_bytes_per_head_dim_opt_a(compressor, b_mse)
+    opt_b = _packed_bytes_per_head_dim_opt_b(compressor, b_mse)
+    layers_per_d = {d: info["n_layers"] for d, info in compressor.summary().items()}
+
+    breakdown_a: dict[str, dict] = {}
+    breakdown_b: dict[str, dict] = {}
+    for d in sorted(set(opt_a) | set(opt_b) | set(base_per_head_dim_mb)):
+        unc = base_per_head_dim_mb.get(d, 0.0)
+        a_mb = opt_a.get(d, 0) / (1024 * 1024)
+        b_mb = opt_b.get(d, 0) / (1024 * 1024)
+        breakdown_a[str(d)] = {
+            "layer_count": layers_per_d.get(d, 0),
+            "uncompressed_mb": unc,
+            "packed_mb_opt_a": a_mb,
+            "compression_ratio_opt_a": (unc / a_mb) if a_mb > 0 else float("nan"),
+        }
+        breakdown_b[str(d)] = {
+            "layer_count": layers_per_d.get(d, 0),
+            "uncompressed_mb": unc,
+            "packed_mb_opt_b": b_mb,
+            "compression_ratio_opt_b": (unc / b_mb) if b_mb > 0 else float("nan"),
+        }
+    return {"opt_a": breakdown_a, "opt_b": breakdown_b}
+
+
 def _generate_turboquant(model, tokenizer, prompt: str, max_tokens: int, device):
     """Generate with HF kv_cache + incremental TurboQuant compression.
 
@@ -266,6 +389,7 @@ def _generate_turboquant(model, tokenizer, prompt: str, max_tokens: int, device)
         "head_dim_layer_counts": {
             d: info["n_layers"] for d, info in compressor.summary().items()
         },
+        "_compressor": compressor,
     }
 
 
@@ -413,7 +537,7 @@ def main() -> int:
     slug = args.model.split("/")[-1].replace("-", "_").replace(".", "_").lower()
     out_path = Path(args.out_dir) / f"tq_bench_results_{slug}_{iso}.json"
 
-    # Per-head_dim compression breakdown
+    # Per-head_dim compression breakdown — in-memory (existing)
     per_head_dim_breakdown: dict[str, dict] = {}
     for d in sorted(set(base["uncompressed_kv_mb_per_head_dim"]) | set(tq["compressed_kv_mb_per_head_dim"])):
         unc = base["uncompressed_kv_mb_per_head_dim"].get(d, 0.0)
@@ -425,6 +549,15 @@ def main() -> int:
             "compressed_mb": com,
             "compression_ratio": ratio,
         }
+
+    # Per-head_dim packed-bits breakdown — OPT-A (conservative) + OPT-B (regenerable-excluded)
+    packed = _compute_packed_breakdown(
+        tq["_compressor"], base["uncompressed_kv_mb_per_head_dim"], b_mse=3,
+    )
+    packed_a_total_mb = sum(v["packed_mb_opt_a"] for v in packed["opt_a"].values())
+    packed_b_total_mb = sum(v["packed_mb_opt_b"] for v in packed["opt_b"].values())
+    packed_a_ratio = (base["uncompressed_kv_mb"] / packed_a_total_mb) if packed_a_total_mb > 0 else float("nan")
+    packed_b_ratio = (base["uncompressed_kv_mb"] / packed_b_total_mb) if packed_b_total_mb > 0 else float("nan")
 
     row = {
         "benchmark": "TurboQuant KV cache compression",
@@ -447,6 +580,12 @@ def main() -> int:
         "results": {
             "kv_cache_compression_ratio_aggregate": compression_ratio,
             "per_head_dim_breakdown": per_head_dim_breakdown,
+            "packed_bits_compression_ratio_aggregate": packed_a_ratio,
+            "packed_bits_per_head_dim_breakdown": packed["opt_a"],
+            "packed_bits_compression_ratio_excluding_regenerable_shared": packed_b_ratio,
+            "packed_bits_per_head_dim_breakdown_regenerable_excluded": packed["opt_b"],
+            "bits_per_slot_formula": "d × (b_mse + 1) / 8 + 6 bytes — PQ b_mse-bit indices + QJL 1-bit signs + PQ FP16 norm (2B) + QJL FP32 r_norm (4B)",
+            "regenerable_shared_includes": ["qjl.S (d × d FP32)", "PQ rotation signs (d FP32)"],
             "prefill_overhead_ms": tq.get("prefill_encode_ms"),
             "per_token_encode_ms": tq.get("per_token_encode_ms"),
             "peak_memory_uncompressed_mb": base["uncompressed_kv_mb"],
