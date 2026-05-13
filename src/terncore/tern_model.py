@@ -49,8 +49,16 @@ ALIGNMENT = 32  # 32-byte SIMD boundary (AVX2)
 #
 # Gemma 4 multimodal: artefacts packed against pre-5.5 transformers had
 # text-tower components at `model.embed_tokens.*` etc.; transformers 5.5+
-# moved these under `model.language_model.*`. Audio/vision paths align
-# in both layouts and need no rewrite.
+# moved these under `model.language_model.*`.
+#
+# Vision and audio tower coverage: artefacts compressed from MLX-source
+# weights (e.g. mlx-community/gemma-4-31b-it-bf16) emit bare
+# `vision_tower.` / `embed_vision.` / `audio_tower.` prefixes whereas
+# the HF Gemma4ForConditionalGeneration skeleton exposes them under
+# `model.<x>.`. Three bare-prefix translations cover this. Artefacts
+# already prefixed (`model.vision_tower.` etc.) don't startswith-match
+# the bare keys and pass through unchanged — additive, backward
+# compatible with the 26b-a4b and gemma4-e4b production manifests.
 GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
     "model.embed_tokens.": "model.language_model.embed_tokens.",
     "model.embed_tokens_per_layer.": "model.language_model.embed_tokens_per_layer.",
@@ -58,6 +66,9 @@ GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
     "model.norm.": "model.language_model.norm.",
     "model.per_layer_model_projection.": "model.language_model.per_layer_model_projection.",
     "model.per_layer_projection_norm.": "model.language_model.per_layer_projection_norm.",
+    "vision_tower.": "model.vision_tower.",
+    "embed_vision.": "model.embed_vision.",
+    "audio_tower.": "model.audio_tower.",
 }
 
 
