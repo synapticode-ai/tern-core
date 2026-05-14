@@ -194,6 +194,59 @@ TQ bench rows for Gemma 4 E4B (`row_v2_deduped`, 2026-05-12) reported `PPL_basel
 
 ---
 
+### `tools/tern_tq_bench.py` device hygiene — replace warning-and-fallback with raise-up-front (R14)
+
+**Status:** Open (small hygiene fix; lands on the branch where the bench tool lives)
+**Surfaced:** 2026-05-14 during R9 Phase B prep — grep against the off-branch `tools/tern_tq_bench.py` source (commit `1572e6f` on `feat/per-layer-head-dim-tq-compressor-gemma4-row-2026-05-13`)
+
+The bench tool already accepts `--device {auto|cpu|mps}` and routes through a `_resolve_device(requested)` helper, then loads the HF model without `device_map` and calls `model.to(device)` afterwards. However, lines 596–601 of the off-branch source apply a warning-and-fallback pattern on `.to()` failure:
+
+```python
+if device.type != "cpu":
+    try:
+        model = model.to(device)
+    except Exception as e:
+        print(f"[bench] WARNING: .to({device}) failed ({type(e).__name__}: {e}); falling back to CPU")
+        device = torch.device("cpu")
+```
+
+This contradicts the R9-α invariant ("`device='mps'` MUST land on MPS, never on CPU fallback, with a clean error if MPS is unavailable"; cf. commit `70c3d9e` on the R9 branch). A future MPS `.to()` failure under this pattern would produce a `row_v*_mps`-labelled JSON that actually ran on CPU — a silent provenance corruption.
+
+**Resolution scope:** Replace lines 596–601 with the raise-up-front pattern: validate device availability before HF load via `terncore.autoscan._validate_device_available` (or an equivalent local helper if the import is undesirable for a CLI tool), then call `model.to(device)` and let any failure propagate. The bench's `_resolve_device("auto")` helper continues to map `"auto"` → MPS-if-available-else-CPU at the operator's request; the change targets only the silent fallback after an explicit choice has been made.
+
+**Trigger:** Land on `feat/per-layer-head-dim-tq-compressor-gemma4-row-2026-05-13` (the branch where the bench tool currently lives) before the R9-β re-run executes against Gemma 4 E4B. Bundle with PR #19 or as a small follow-on PR off that branch.
+
+**Estimated effort:** ~15 min focused work (one function edit + a small inline test if any).
+
+---
+
+### Gemma 4 E4B TQ bench MPS re-run — gated on PR #19 + R14 (R9-β)
+
+**Status:** Open (deferred from R9 sprint — execution blocked on dependencies below)
+**Surfaced:** Originally scoped as R9 Phase B in the 2026-05-14 R9 briefing; deferred when Phase B prep revealed the bench tool is off-branch
+
+Re-execute the TurboQuant bench against `google/gemma-4-E4B-it` under FP16/MPS using the D1-formalised per-head_dim compressor (commit `5362bf0`). Produces a canonical `row_v3_mps` JSON to supersede `row_v2_deduped` (`benchmarks/tq_bench_results_gemma_4_e4b_it_20260512T222533Z.json`, the 2026-05-12 FP32/CPU row). Cross-architecture per-token encode comparison feeds the Bracket 3 "constant per-token encode cost at scale" empirical work: same family, very different scale (4B vs 31B), expected near-identical per-token encode.
+
+**Acceptance gate (from original briefing, preserved here for the follow-on sprint):**
+
+- `row_v3_mps` JSON written and committed to `benchmarks/`
+- Schema matches `row_v2_deduped` (same field names, same types)
+- `config.device = "mps"`, `config.dtype = "float16"`
+- `per_token_encode_ms` within ±30% of `row_v2_deduped`'s 21.70 ms
+- `kv_cache_compression_ratio_aggregate` within ±15% of `row_v2_deduped`'s 0.261
+- No crash at heterogeneous head_dim (D1 fix should hold)
+- Per-head_dim breakdown shows the expected 256/512 split (20 sliding + 4 full)
+
+PPL pathology persists (R9.3 collateral — not a blocker for R9-β).
+
+**Blocked on:**
+1. **PR #19 merge to main** — the bench tool (`tools/tern_tq_bench.py`) currently lives only on `feat/per-layer-head-dim-tq-compressor-gemma4-row-2026-05-13`. Once that branch lands on main, the R9 branch (or its successor) can run the bench from a clean main checkout.
+2. **R14 hygiene fix** — the off-branch bench's warning-and-fallback at lines 596–601 must be replaced with a raise-up-front pattern before any `row_v3_mps` produced is provenance-trustworthy under the R9-α invariant.
+
+**Trigger:** Once both blockers clear, execute the bench per the briefing's original Phase B command shape (`/Users/syn/synapticode/venv/bin/python tools/tern_tq_bench.py --model-id google/gemma-4-E4B-it --device mps --dtype float16 --prompt "The future of computing lies in" --max-tokens 100 --b-mse 3 --mixed-precision --threshold 0.7 --no-autoscan --output benchmarks/tq_bench_results_gemma4_e4b_mps_<TIMESTAMP>.json`).
+
+---
+
 ## Closed
 
 ### reconstruct_all suffix-doubling — production manifest support
