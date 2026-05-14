@@ -1,0 +1,70 @@
+{
+  "benchmark": "TurboQuant KV cache compression",
+  "hardware": "Apple M4 Pro",
+  "date_utc": "20260512T223645Z",
+  "model": "google/gemma-4-E4B-it",
+  "model_class": "Gemma4ForCausalLM",
+  "method": "incremental TurboQuant (QJL + rotation, mixed-precision 3-bit MSE) \u2014 per-head_dim lazy compressor",
+  "description": "Measures KV cache compression via TurboQuant hook during autoregressive generation. Prefill encodes full prompt KV in one batch; each decode step encodes only the new KV pair. Per-layer head_dim detected lazily \u2014 supports heterogeneous attention (e.g. Gemma 4 sliding/full mix).",
+  "config": {
+    "threshold": 0.7,
+    "autoscan": false,
+    "prompt": "The future of computing lies in",
+    "max_tokens": 100,
+    "dtype": "fp32",
+    "device": "cpu",
+    "b_mse": 3,
+    "mixed_precision": true
+  },
+  "results": {
+    "kv_cache_compression_ratio_aggregate": 0.26129155390257913,
+    "per_head_dim_breakdown": {
+      "256": {
+        "layer_count": 20,
+        "uncompressed_mb": 8.203125,
+        "compressed_mb": 28.54422378540039,
+        "compression_ratio": 0.287383011767014
+      },
+      "512": {
+        "layer_count": 4,
+        "uncompressed_mb": 3.28125,
+        "compressed_mb": 15.40811538696289,
+        "compression_ratio": 0.21295595973900416
+      }
+    },
+    "prefill_overhead_ms": 135.60954199783737,
+    "per_token_encode_ms": 21.69775130283652,
+    "peak_memory_uncompressed_mb": 11.484375,
+    "peak_memory_compressed_mb": 43.95233917236328,
+    "perplexity_baseline": 369578.88442269736,
+    "perplexity_with_ternary_weights": 390404.6963406619,
+    "perplexity_delta_pct": 5.635011304960134,
+    "ppl_note": "PPL_baseline measured on a short canonical passage set (5 sentences), single forward pass each \u2014 not comparable to WikiText-2 sliding-window perplexity in tq_bench_results.json. ternary PPL reflects weight-only compression impact; the TurboQuant compressor encodes KV state but does not route back into forward in this harness. For Gemma 4 specifically, see Gemma-4-PPL-methodology backlog item \u2014 baseline numbers may be pathological without proper logit-softcap / chat-template preprocessing."
+  },
+  "tokens": {
+    "baseline_tps": 0.46808310116218604,
+    "turboquant_tps": 0.4488678078520255,
+    "tokens_generated_baseline": 100,
+    "tokens_generated_tq": 100
+  },
+  "memory_mib": {
+    "rss_start": 182.109375,
+    "rss_after_load": 29188.640625,
+    "rss_after_convert": 44379.921875,
+    "rss_peak": 44379.921875
+  },
+  "conversion_report": {
+    "total_layers": 344,
+    "converted_layers": 343,
+    "skipped_layers": 1,
+    "total_params": 4643880960,
+    "ternary_params": 3972792320,
+    "compression_ratio": 3.9769889153921705,
+    "original_size_mb": 8857.5,
+    "ternary_size_mb": 2227.1875
+  },
+  "timings_s": {
+    "model_load": 55.914692125006695,
+    "convert": 32.19114204200014
+  }
+}

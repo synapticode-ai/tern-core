@@ -140,6 +140,50 @@ Test coverage: synthetic fixture mirroring Gemma 4 MoE expert structure (small N
 
 ---
 
+### load_packed_model: Gemma 4 attention KV-sharing layout adapter (R10)
+
+**Status:** Open (medium priority, natural integration with L5 sprint week of 2026-05-12 alongside MoE restacking work)
+**Surfaced:** 2026-05-13 R4-C Phase 5 attempt (gemma4-e4b via packed loader)
+
+**Observation:** The gemma4-e4b production manifest (packed 2026-05-01, `compressed/gemma4-e4b/...`) carries per-layer K/V projections and norms (`model.layers.X.self_attn.{k_proj,v_proj,k_norm,v_norm}.weight` for every X). Current transformers Gemma 4 model layout exposes per-layer K/V only on a subset of layers — sliding-attention layers share K/V with their nearest full-attention neighbour for parameter efficiency, so layers like `layers.24.self_attn` only have `q_proj`, `q_norm`, `o_proj` directly. `_resolve_module_or_raise` correctly fires loud failure on the first absent target (verified: layer 24 `k_norm` lookup raises `ValueError` with diagnostic naming the manifest entry and missing component).
+
+This is a third member of the "Gemma 4 family architecture drift between pack-time and load-time" pattern alongside the bare-prefix vision/audio_tower preset coverage (closed today, commit `cc84111`) and the MoE per-expert restacking gap (above). The pattern: transformers ≥5.5 introduces module-layout refactors that legacy artefacts can't trivially target without an adapter.
+
+**Resolution scope:** Two paths under design:
+1. **Layer-grouping translation** — extend `GEMMA4_MULTIMODAL_TRANSFORMERS_5_5` (or add a sibling preset) with mappings that route shared-K/V layer entries to their owning full-attention neighbour. Requires probing the transformers Gemma 4 source to enumerate the sharing pattern (which sliding layers share with which full layer).
+2. **Manifest-side filter at load time** — pair with R11 (strict=False mode) to silently drop manifest entries that have no target on the current model. Dovetails with KV-sharing layouts where sliding-layer K/V are redundant with the full-attention parent's stored projections.
+
+Path 2 is mechanically simpler but informationally lossy (the manifest's per-layer K/V data is discarded silently). Path 1 preserves the bytes but requires explicit layout knowledge.
+
+**Affected artefacts on disk:** gemma4-e4b confirmed; gemma4-31b loaded cleanly via the same key_mapping today (the 31B layer count + sliding/full mix may keep K/V per-layer everywhere — verify during R10 implementation by testing both artefacts after the adapter lands).
+
+**Trigger:** L5 sprint companion work to MoE restacking. Both R10 and the MoE restacking gap originate in the `load_packed_model` dispatch logic and benefit from a single-session focus.
+
+**Estimated effort:** ~2-3 hours including transformers source probe, preset extension, integration test on gemma4-e4b, retest on gemma4-31b.
+
+---
+
+### load_packed_model: optional strict=False mode for missing-target manifest entries (R11)
+
+**Status:** Open (low priority utility; bundle with R10 if natural)
+**Surfaced:** 2026-05-13 R4-C Phase 5 attempt (gemma4-e4b via packed loader)
+
+**Observation:** `load_packed_model` currently hard-fails via `_resolve_module_or_raise` on the first manifest entry whose target module/parameter doesn't exist on the model. This is the right default for catching pack-time/load-time architecture drift loudly, but it forecloses a "best-effort load" mode useful for two cases:
+
+1. **R4-C Phase 5 retrospective:** today's gemma4-e4b attempt would have completed with informative warnings instead of hard-fail at the first `k_norm` mismatch. Operator could have inspected which entries were skipped and whether the model still produced healthy logits with the partial load (KV-shared layers may forward correctly using the parent layer's projections).
+2. **Cross-version artefact loading:** loading a manifest packed against transformers N against a model from transformers N+k where some layers were refactored. Strict default protects production; opt-in `strict=False` enables exploratory loads + manual diagnosis.
+
+**Resolution scope:** Add `strict: bool = True` parameter to `load_packed_model`. When `strict=False`:
+- `_resolve_module_or_raise` and `_replace_parameter_or_raise` log a WARNING with the manifest entry name + missing path component, append to a `skipped_keys` return list, and continue iteration instead of raising.
+- Return signature extends to `(missing_keys, unexpected_keys, skipped_keys)` — additive; existing callers ignore the third tuple element.
+- Default behaviour unchanged (`strict=True` raises as today).
+
+**Trigger:** Bundle with R10 as a useful adjunct (Phase 5-style runs would benefit from `strict=False` to surface the full coverage gap before a layout adapter lands). Standalone if R10 takes a different design path.
+
+**Estimated effort:** ~1 hour focused work + test additions.
+
+---
+
 ### Analysis plot tooling: include model name as plot title attribution
 
 **Status:** Open (low priority, applied after current rewrite work lands)

@@ -49,8 +49,16 @@ ALIGNMENT = 32  # 32-byte SIMD boundary (AVX2)
 #
 # Gemma 4 multimodal: artefacts packed against pre-5.5 transformers had
 # text-tower components at `model.embed_tokens.*` etc.; transformers 5.5+
-# moved these under `model.language_model.*`. Audio/vision paths align
-# in both layouts and need no rewrite.
+# moved these under `model.language_model.*`.
+#
+# Vision and audio tower coverage: artefacts compressed from MLX-source
+# weights (e.g. mlx-community/gemma-4-31b-it-bf16) emit bare
+# `vision_tower.` / `embed_vision.` / `audio_tower.` prefixes whereas
+# the HF Gemma4ForConditionalGeneration skeleton exposes them under
+# `model.<x>.`. Three bare-prefix translations cover this. Artefacts
+# already prefixed (`model.vision_tower.` etc.) don't startswith-match
+# the bare keys and pass through unchanged — additive, backward
+# compatible with the 26b-a4b and gemma4-e4b production manifests.
 GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
     "model.embed_tokens.": "model.language_model.embed_tokens.",
     "model.embed_tokens_per_layer.": "model.language_model.embed_tokens_per_layer.",
@@ -58,6 +66,9 @@ GEMMA4_MULTIMODAL_TRANSFORMERS_5_5: Dict[str, str] = {
     "model.norm.": "model.language_model.norm.",
     "model.per_layer_model_projection.": "model.language_model.per_layer_model_projection.",
     "model.per_layer_projection_norm.": "model.language_model.per_layer_projection_norm.",
+    "vision_tower.": "model.vision_tower.",
+    "embed_vision.": "model.embed_vision.",
+    "audio_tower.": "model.audio_tower.",
 }
 
 
@@ -221,6 +232,43 @@ def _resolve_parameter_or_raise(
             f"(type {type(module).__name__})."
         )
     return getattr(module, param_name)
+
+
+def _replace_parameter_or_raise(
+    root: "nn.Module",
+    module_path: str,
+    param_name: str,
+    new_value: "torch.Tensor",
+    *,
+    diagnostic_entry_name: str,
+) -> None:
+    """Replace the named parameter on the resolved module with new_value.
+
+    Wraps new_value in nn.Parameter and uses setattr rather than .data
+    assignment, which composes with both meta-init (accelerate
+    init_empty_weights) and real-allocation init paths uniformly.
+    Direct .data assignment raises RuntimeError on meta-device
+    parameters because storage isn't materialised.
+
+    Preserves the existing parameter's requires_grad flag so loads do
+    not silently change autograd behaviour for callers that intend to
+    fine-tune.
+    """
+    parent = _resolve_module_or_raise(
+        root, module_path,
+        diagnostic_entry_name=diagnostic_entry_name,
+    )
+    if not hasattr(parent, param_name):
+        raise ValueError(
+            f"Manifest entry {diagnostic_entry_name!r} resolves to "
+            f"parameter {param_name!r} on module path {module_path!r}, but "
+            f"that parameter does not exist on the resolved module "
+            f"(type {type(parent).__name__})."
+        )
+    requires_grad = getattr(parent, param_name).requires_grad
+    setattr(parent, param_name, torch.nn.Parameter(
+        new_value, requires_grad=requires_grad,
+    ))
 
 
 def _align_to(offset: int, alignment: int = ALIGNMENT) -> int:
@@ -1527,17 +1575,20 @@ class TernModelReader:
                     # not currently exercised by tests; silent-skip
                     # behaviour preserved here for backwards compat.
                 else:
-                    # Parameter-path naming (production): walk to the
-                    # parent of the parameter, set the parameter's data.
-                    # Handles nn.Linear, nn.LayerNorm, nn.Embedding, and
+                    # Parameter-path naming (production): replace the
+                    # named parameter on the resolved parent module.
+                    # setattr rather than .data assignment so meta-init
+                    # callers (accelerate init_empty_weights) load
+                    # cleanly — direct .data assignment raises
+                    # RuntimeError on meta-device storage. Handles
+                    # nn.Linear, nn.LayerNorm, nn.Embedding, and
                     # arbitrary module-level Parameters (layer_scalar,
                     # per_expert_scale, calibration tensors, etc.)
                     # uniformly.
-                    target_param = _resolve_parameter_or_raise(
-                        model, module_path, param_name,
+                    _replace_parameter_or_raise(
+                        model, module_path, param_name, tensors["weight"],
                         diagnostic_entry_name=raw_name,
                     )
-                    target_param.data = tensors["weight"]
                     loaded_keys.append(name)
 
             elif entry["dtype"] == "int4_block32":
@@ -1576,12 +1627,13 @@ class TernModelReader:
                             loaded_keys.append(f"{module_path}.bias")
                 else:
                     # Parameter-path naming (production): same path as
-                    # FP16 branch — walk to the parameter, set its .data.
-                    target_param = _resolve_parameter_or_raise(
-                        model, module_path, param_name,
+                    # FP16 branch — replace the named parameter on the
+                    # resolved parent module via setattr so meta-init
+                    # (init_empty_weights) callers load cleanly.
+                    _replace_parameter_or_raise(
+                        model, module_path, param_name, tensors["weight"],
                         diagnostic_entry_name=raw_name,
                     )
-                    target_param.data = tensors["weight"]
                     loaded_keys.append(name)
 
         missing = [k for k in model_keys if k not in loaded_keys]

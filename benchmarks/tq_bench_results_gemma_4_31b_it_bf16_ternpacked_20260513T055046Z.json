@@ -1,0 +1,112 @@
+{
+  "benchmark": "TurboQuant KV cache compression",
+  "hardware": "Apple M4 Pro",
+  "date_utc": "20260513T055046Z",
+  "model": "mlx-community/gemma-4-31b-it-bf16",
+  "model_class": "Gemma4ForConditionalGeneration",
+  "source_path": "/Volumes/Syn Archive/models/compressed/gemma4-31b/gemma4_31b_ternary_v0.1.0.tern-model/model.tern-model",
+  "source_kind": "tern_model_packed",
+  "key_mapping": "GEMMA4_MULTIMODAL_TRANSFORMERS_5_5",
+  "load_packed_keys": {
+    "missing": 418,
+    "unexpected": 820
+  },
+  "method": "incremental TurboQuant (QJL + rotation, mixed-precision 3-bit MSE) \u2014 per-head_dim lazy compressor",
+  "description": "Measures KV cache compression via TurboQuant hook during autoregressive generation. Prefill encodes full prompt KV in one batch; each decode step encodes only the new KV pair. Per-layer head_dim detected lazily \u2014 supports heterogeneous attention (e.g. Gemma 4 sliding/full mix).",
+  "config": {
+    "threshold": 0.7,
+    "autoscan": false,
+    "prompt": "The future of computing lies in",
+    "max_tokens": 100,
+    "dtype": "fp32",
+    "device": "cpu",
+    "b_mse": 3,
+    "mixed_precision": true
+  },
+  "results": {
+    "kv_cache_compression_ratio_aggregate": 0.2785340136337586,
+    "per_head_dim_breakdown": {
+      "256": {
+        "layer_count": 50,
+        "uncompressed_mb": 164.0625,
+        "compressed_mb": 570.883243560791,
+        "compression_ratio": 0.28738363203075806
+      },
+      "512": {
+        "layer_count": 10,
+        "uncompressed_mb": 16.40625,
+        "compressed_mb": 77.04031753540039,
+        "compression_ratio": 0.21295667677461547
+      }
+    },
+    "packed_bits_compression_ratio_aggregate": 0.6824886681069644,
+    "packed_bits_per_head_dim_breakdown": {
+      "256": {
+        "layer_count": 50,
+        "uncompressed_mb": 164.0625,
+        "packed_mb_opt_a": 222.25043106079102,
+        "compression_ratio_opt_a": 0.7381875446402388
+      },
+      "512": {
+        "layer_count": 10,
+        "uncompressed_mb": 16.40625,
+        "packed_mb_opt_a": 42.17703628540039,
+        "compression_ratio_opt_a": 0.38898536845935366
+      }
+    },
+    "packed_bits_compression_ratio_excluding_regenerable_shared": 7.657333794738108,
+    "packed_bits_per_head_dim_breakdown_regenerable_excluded": {
+      "256": {
+        "layer_count": 50,
+        "uncompressed_mb": 164.0625,
+        "packed_mb_opt_b": 21.469181060791016,
+        "compression_ratio_opt_b": 7.641767961966
+      },
+      "512": {
+        "layer_count": 10,
+        "uncompressed_mb": 16.40625,
+        "packed_mb_opt_b": 2.0989112854003906,
+        "compression_ratio_opt_b": 7.816552378425239
+      }
+    },
+    "bits_per_slot_formula": "d \u00d7 (b_mse + 1) / 8 + 6 bytes \u2014 PQ b_mse-bit indices + QJL 1-bit signs + PQ FP16 norm (2B) + QJL FP32 r_norm (4B)",
+    "regenerable_shared_includes": [
+      "qjl.S (d \u00d7 d FP32)",
+      "PQ rotation signs (d FP32)"
+    ],
+    "prefill_overhead_ms": 903.8066250004704,
+    "per_token_encode_ms": 334.59123352524256,
+    "peak_memory_uncompressed_mb": 180.46875,
+    "peak_memory_compressed_mb": 647.9235610961914,
+    "perplexity_baseline": NaN,
+    "perplexity_with_ternary_weights": 3131165629043.249,
+    "perplexity_delta_pct": NaN,
+    "ppl_note": "PPL_baseline measured on a short canonical passage set (5 sentences), single forward pass each \u2014 not comparable to WikiText-2 sliding-window perplexity in tq_bench_results.json. ternary PPL reflects weight-only compression impact; the TurboQuant compressor encodes KV state but does not route back into forward in this harness. For Gemma 4 specifically, see Gemma-4-PPL-methodology backlog item \u2014 baseline numbers may be pathological without proper logit-softcap / chat-template preprocessing."
+  },
+  "tokens": {
+    "baseline_tps": 0.07619009033239589,
+    "turboquant_tps": 0.07423385263337597,
+    "tokens_generated_baseline": 100,
+    "tokens_generated_tq": 100
+  },
+  "memory_mib": {
+    "rss_start": 183.078125,
+    "rss_after_load": 23048.609375,
+    "rss_after_convert": 23048.609375,
+    "rss_peak": 23048.609375
+  },
+  "conversion_report": {
+    "total_layers": 1188,
+    "converted_layers": 410,
+    "skipped_layers": 778,
+    "total_params": 31273088876,
+    "ternary_params": 29286727680,
+    "compression_ratio": 4.182096392904198,
+    "original_size_mb": 59648.6833114624,
+    "ternary_size_mb": 14262.866683959961
+  },
+  "timings_s": {
+    "model_load": 138.50369750000027,
+    "convert": 0.0
+  }
+}

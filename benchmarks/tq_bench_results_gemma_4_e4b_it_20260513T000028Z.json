@@ -1,0 +1,105 @@
+{
+  "benchmark": "TurboQuant KV cache compression",
+  "hardware": "Apple M4 Pro",
+  "date_utc": "20260513T000028Z",
+  "model": "google/gemma-4-E4B-it",
+  "model_class": "Gemma4ForCausalLM",
+  "method": "incremental TurboQuant (QJL + rotation, mixed-precision 3-bit MSE) \u2014 per-head_dim lazy compressor",
+  "description": "Measures KV cache compression via TurboQuant hook during autoregressive generation. Prefill encodes full prompt KV in one batch; each decode step encodes only the new KV pair. Per-layer head_dim detected lazily \u2014 supports heterogeneous attention (e.g. Gemma 4 sliding/full mix).",
+  "config": {
+    "threshold": 0.7,
+    "autoscan": false,
+    "prompt": "The future of computing lies in",
+    "max_tokens": 100,
+    "dtype": "fp32",
+    "device": "cpu",
+    "b_mse": 3,
+    "mixed_precision": true
+  },
+  "results": {
+    "kv_cache_compression_ratio_aggregate": 0.26129155390257913,
+    "per_head_dim_breakdown": {
+      "256": {
+        "layer_count": 20,
+        "uncompressed_mb": 8.203125,
+        "compressed_mb": 28.54422378540039,
+        "compression_ratio": 0.287383011767014
+      },
+      "512": {
+        "layer_count": 4,
+        "uncompressed_mb": 3.28125,
+        "compressed_mb": 15.40811538696289,
+        "compression_ratio": 0.21295595973900416
+      }
+    },
+    "packed_bits_compression_ratio_aggregate": 0.5874948920869206,
+    "packed_bits_per_head_dim_breakdown": {
+      "256": {
+        "layer_count": 20,
+        "uncompressed_mb": 8.203125,
+        "packed_mb_opt_a": 11.11258316040039,
+        "compression_ratio_opt_a": 0.7381834521816473
+      },
+      "512": {
+        "layer_count": 4,
+        "uncompressed_mb": 3.28125,
+        "packed_mb_opt_a": 8.43545913696289,
+        "compression_ratio_opt_a": 0.3889829761159135
+      }
+    },
+    "packed_bits_compression_ratio_excluding_regenerable_shared": 7.690319152740667,
+    "packed_bits_per_head_dim_breakdown_regenerable_excluded": {
+      "256": {
+        "layer_count": 20,
+        "uncompressed_mb": 8.203125,
+        "packed_mb_opt_b": 1.0735206604003906,
+        "compression_ratio_opt_b": 7.64132941506732
+      },
+      "512": {
+        "layer_count": 4,
+        "uncompressed_mb": 3.28125,
+        "packed_mb_opt_b": 0.4198341369628906,
+        "compression_ratio_opt_b": 7.815586468829788
+      }
+    },
+    "bits_per_slot_formula": "d \u00d7 (b_mse + 1) / 8 + 6 bytes \u2014 PQ b_mse-bit indices + QJL 1-bit signs + PQ FP16 norm (2B) + QJL FP32 r_norm (4B)",
+    "regenerable_shared_includes": [
+      "qjl.S (d \u00d7 d FP32)",
+      "PQ rotation signs (d FP32)"
+    ],
+    "prefill_overhead_ms": 183.15441699814983,
+    "per_token_encode_ms": 20.799587545325544,
+    "peak_memory_uncompressed_mb": 11.484375,
+    "peak_memory_compressed_mb": 43.95233917236328,
+    "perplexity_baseline": 499784.5521790191,
+    "perplexity_with_ternary_weights": 454904.29533559247,
+    "perplexity_delta_pct": -8.979920777413474,
+    "ppl_note": "PPL_baseline measured on a short canonical passage set (5 sentences), single forward pass each \u2014 not comparable to WikiText-2 sliding-window perplexity in tq_bench_results.json. ternary PPL reflects weight-only compression impact; the TurboQuant compressor encodes KV state but does not route back into forward in this harness. For Gemma 4 specifically, see Gemma-4-PPL-methodology backlog item \u2014 baseline numbers may be pathological without proper logit-softcap / chat-template preprocessing."
+  },
+  "tokens": {
+    "baseline_tps": 0.4747328628151298,
+    "turboquant_tps": 0.42338778277336797,
+    "tokens_generated_baseline": 100,
+    "tokens_generated_tq": 100
+  },
+  "memory_mib": {
+    "rss_start": 182.453125,
+    "rss_after_load": 29191.953125,
+    "rss_after_convert": 40005.84375,
+    "rss_peak": 40005.84375
+  },
+  "conversion_report": {
+    "total_layers": 344,
+    "converted_layers": 343,
+    "skipped_layers": 1,
+    "total_params": 4643880960,
+    "ternary_params": 3972792320,
+    "compression_ratio": 3.9769889153921705,
+    "original_size_mb": 8857.5,
+    "ternary_size_mb": 2227.1875
+  },
+  "timings_s": {
+    "model_load": 55.144399166994845,
+    "convert": 36.297634916998504
+  }
+}
