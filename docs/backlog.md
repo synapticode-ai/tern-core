@@ -176,6 +176,24 @@ Test coverage: synthetic fixture mirroring Gemma 4 MoE expert structure (small N
 
 ---
 
+### Gemma 4 PPL methodology — logit-softcap and chat-template preprocessing required for trustworthy PPL (R9.3)
+
+**Status:** Open (calibration item; blocks any Gemma 4 PPL comparison)
+**Surfaced:** 2026-05-14 during R9 scoping; root cause observed in TQ bench rows for Gemma 4 E4B from 2026-05-12
+
+TQ bench rows for Gemma 4 E4B (`row_v2_deduped`, 2026-05-12) reported `PPL_baseline` ~369k — pathological for a 4B Instruct model (healthy range ~10–30). Root cause is NOT ternary conversion; `PPL_baseline` is the pre-MPC FP32/CPU forward-pass result. Suspected contributors: (a) final logit-softcapping not applied in raw forward; (b) Gemma 4 expects Instruct-template prompts that bare passages do not satisfy; (c) tokenizer prefix/BOS handling; (d) FP32 cast vs Gemma 4's native bf16 numerics. Any PPL comparison involving Gemma 4 is untrustworthy until this calibration item lands. Distinct from R7-A v1.0 methodology, which assumes a working forward-pass baseline.
+
+---
+
+### `ppl_headroom` terminology disambiguation between autoscan.py and R7-A/R8 specs (R13)
+
+**Status:** Open (docs + small refactor; not blocking R8 v1.1 or R9)
+**Surfaced:** 2026-05-14 during R9 scoping survey
+
+`autoscan.auto_scan(ppl_headroom: float = 0.2)` uses the parameter in its autoscan-internal sense: maximum PPL degradation per added layer, applied as a scan-time gate during perplexity-gated layer-eligibility scanning. R7-A v1.0 §7 and R8 v1.0 use the same identifier with a distinct semantic: `ppl_headroom = (ppl_ternary - ppl_fp16) / ppl_fp16` as the diagnostic outcome metric. The two are related conceptually but not interchangeable. Anyone reading the autoscan module alongside the methodology specs will hit a vocabulary collision. Resolution options: (a) rename one of the two (likely autoscan's internal parameter — `per_layer_ppl_budget` or similar), (b) annotate both sites with cross-references to the other definition. Targeted as a docs + small refactor item; not blocking R8 v1.1 or R9 work.
+
+---
+
 ## Closed
 
 ### reconstruct_all suffix-doubling — production manifest support
