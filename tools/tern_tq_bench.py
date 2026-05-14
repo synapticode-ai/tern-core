@@ -416,12 +416,35 @@ def _resolve_model_class(model_id: str, override: str | None) -> str:
     return "AutoModelForCausalLM"
 
 
+def _assert_device_available(device: torch.device) -> None:
+    """R14 (2026-05-14): raise up-front if an explicitly-requested non-CPU device
+    is unavailable. Matches the R9-α invariant from src/terncore/autoscan.py
+    (_validate_device_available): device='mps' / device='cuda' MUST land on the
+    requested backend, with a clean error if the backend is unavailable. No
+    silent CPU fallback — a future row_v*_mps-labelled JSON must never actually
+    run on CPU under our provenance contract."""
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"device={device} requested but torch.cuda.is_available() is False"
+            )
+    elif device.type == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "device=mps requested but torch.backends.mps.is_available() is False"
+            )
+    # device.type == "cpu" is always available; unknown types defer to torch.device() validation.
+
+
 def _resolve_device(requested: str) -> torch.device:
     if requested == "auto":
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    return torch.device(requested)
+    # R14: explicit requests validate up-front; no silent CPU fallback later.
+    device = torch.device(requested)
+    _assert_device_available(device)
+    return device
 
 
 class _TernModelStubReport:
@@ -594,11 +617,11 @@ def _load_via_tern_model(args, dtype, device, rss_start):
     )
 
     if device.type != "cpu":
-        try:
-            model = model.to(device)
-        except Exception as e:
-            print(f"[bench] WARNING: .to({device}) failed ({type(e).__name__}: {e}); falling back to CPU")
-            device = torch.device("cpu")
+        # R14: raise-up-front — no silent CPU fallback. Availability was validated
+        # at _resolve_device time, so a .to() failure here is a genuine runtime
+        # error that must surface rather than corrupt provenance of *_mps-labelled
+        # output. Matches R9-α invariant in src/terncore/autoscan.py.
+        model = model.to(device)
     model.eval()
 
     report = _TernModelStubReport(reader, meta_json)
@@ -705,11 +728,11 @@ def main() -> int:
             tokenizer.pad_token = tokenizer.eos_token
         model = cls.from_pretrained(args.model, dtype=dtype)
         if device.type != "cpu":
-            try:
-                model = model.to(device)
-            except Exception as e:
-                print(f"[bench] WARNING: .to({device}) failed ({type(e).__name__}: {e}); falling back to CPU")
-                device = torch.device("cpu")
+            # R14: raise-up-front — no silent CPU fallback. Availability was validated
+            # at _resolve_device time, so a .to() failure here is a genuine runtime
+            # error that must surface rather than corrupt provenance of *_mps-labelled
+            # output. Matches R9-α invariant in src/terncore/autoscan.py.
+            model = model.to(device)
         model.eval()
         t_load = time.perf_counter() - t_load0
         rss_after_load = _rss_mb()
