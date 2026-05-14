@@ -39,6 +39,10 @@ CACHE_DIR = Path.home() / ".terncore"
 CACHE_FILE = CACHE_DIR / "model_cache.json"
 
 DEFAULT_BLOCK_SIZE = 10
+# Autoscan-internal per-layer scan-time gate: maximum PPL degradation
+# allowed per added layer-block during perplexity-gated layer-eligibility
+# scanning. NOT the R7-A/R8 v1.1 outcome metric of the same name — see
+# auto_scan() docstring for terminology distinction. R13.
 DEFAULT_PPL_HEADROOM = 0.20
 
 # Projection types ordered by empirical quantization tolerance (most -> least).
@@ -272,7 +276,20 @@ def auto_scan(
     Args:
         model_id:      HuggingFace model ID or local path.
         threshold:     Ternary quantization threshold.
-        ppl_headroom:  Maximum allowed PPL increase as a fraction (0.20 = 20%).
+        ppl_headroom:  Maximum allowed PPL degradation as a fraction (0.20 = 20%),
+                       applied as a per-layer scan-time GATE during the sweep:
+                       adding a layer-block is accepted only if cumulative PPL
+                       degradation stays under this threshold.
+
+                       NOTE: this is autoscan's *internal* (autoscan-internal) sense of `ppl_headroom`
+                       — a scan-time gate on per-layer additions. DISTINCT from
+                       the R7-A v1.0 WikiText-2 PPL methodology / R8 v1.1
+                       weight-compression PPL headroom diagnostic outcome metric
+                       of the same name (`ppl_headroom = (ppl_ternary - ppl_fp16)
+                       / ppl_fp16`), which is a measured *result* of compression
+                       rather than a *gate* during scanning. The two are
+                       conceptually related but not interchangeable. See R13
+                       (docs/backlog.md) for terminology disambiguation tracking.
         block_size:    Number of layers to add per sweep step.
         use_cache:     If True, return cached result when available.
 
@@ -505,7 +522,20 @@ def streaming_scan(
     Args:
         model_id:     Local path to a sharded safetensors model directory.
         threshold:    Ternary quantisation threshold.
-        ppl_headroom: Maximum allowed PPL increase as a fraction.
+        ppl_headroom: Maximum allowed PPL degradation as a fraction (0.20 = 20%),
+                      applied as a per-layer scan-time GATE during the sweep:
+                      adding a layer-block is accepted only if cumulative PPL
+                      degradation stays under this threshold.
+
+                      NOTE: this is autoscan's *internal* (autoscan-internal) sense of `ppl_headroom`
+                      — a scan-time gate on per-layer additions. DISTINCT from
+                      the R7-A v1.0 WikiText-2 PPL methodology / R8 v1.1
+                      weight-compression PPL headroom diagnostic outcome metric
+                      of the same name (`ppl_headroom = (ppl_ternary - ppl_fp16)
+                      / ppl_fp16`), which is a measured *result* of compression
+                      rather than a *gate* during scanning. The two are
+                      conceptually related but not interchangeable. See R13
+                      (docs/backlog.md) for terminology disambiguation tracking.
         use_cache:    Return cached result if available.
         baseline_ppl: Pre-computed baseline PPL (skips Pass 1 if given).
 
@@ -724,7 +754,10 @@ def main():
     )
     parser.add_argument(
         "--ppl-headroom", type=float, default=DEFAULT_PPL_HEADROOM,
-        help=f"Maximum allowed PPL increase as a fraction (default: {DEFAULT_PPL_HEADROOM})",
+        help="PPL headroom threshold for autoscan per-layer scan-time gate "
+             "(max PPL degradation per layer-block; default 0.20). "
+             "Autoscan-internal sense — distinct from R7-A/R8 v1.1 outcome metric. "
+             "R13.",
     )
     parser.add_argument(
         "--block-size", type=int, default=DEFAULT_BLOCK_SIZE,
