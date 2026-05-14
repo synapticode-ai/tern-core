@@ -38,6 +38,13 @@ import torch.nn as nn
 CACHE_DIR = Path.home() / ".terncore"
 CACHE_FILE = CACHE_DIR / "model_cache.json"
 
+# Cache schema versions:
+#   v1.0 (implicit) — entries flat at top level, no schema_version field
+#   v2.0 (explicit) — {"schema_version": "autoscan_cache/2.0", "entries": {...}}
+#                     Entries gain `device_used` field via ScanResult augmentation.
+# Old caches are auto-migrated on next write (R9-α, 2026-05-14).
+CACHE_SCHEMA_VERSION = "autoscan_cache/2.0"
+
 DEFAULT_BLOCK_SIZE = 10
 DEFAULT_PPL_HEADROOM = 0.20
 
@@ -88,6 +95,9 @@ class ScanResult:
     ternary_list: list[str] = field(default_factory=list)
     int4_list: list[str] = field(default_factory=list)
     mixed_compression_ratio: float = 0.0
+    # R9-α (2026-05-14): records which device the scan ran on.
+    # Empty string = unknown / v1.0 cache entry without device provenance.
+    device_used: str = ""
 
     @property
     def ppl_delta_pct(self) -> float:
@@ -148,9 +158,90 @@ def _measure_perplexity(model, tokenizer) -> float:
     input_ids = tokenizer(_CALIBRATION_TEXT, return_tensors="pt").input_ids
     if input_ids.shape[1] < 2:
         return float("inf")
+    # Match model device so MPS-resident models don't error on CPU inputs.
+    try:
+        target_device = next(model.parameters()).device
+        input_ids = input_ids.to(target_device)
+    except StopIteration:
+        pass
     with torch.no_grad():
         outputs = model(input_ids, labels=input_ids)
     return math.exp(outputs.loss.item())
+
+
+# ---------------------------------------------------------------------------
+# Device dispatch (R9-α, 2026-05-14)
+# ---------------------------------------------------------------------------
+
+def _validate_device_available(device: str) -> None:
+    """Raise RuntimeError if the requested device is not available on this host.
+
+    Called BEFORE HF model load so the operator gets a clean error rather
+    than a delayed accelerate dispatch fallback.
+
+    R9-α invariant: ``device="mps"`` MUST land on MPS; no silent CPU fallback.
+    """
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"device='{device}' requested but torch.cuda.is_available() is False"
+            )
+    elif device == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "device='mps' requested but torch.backends.mps.is_available() is False"
+            )
+    elif device == "cpu":
+        return
+    else:
+        # Unknown identifier — defer to torch.device() at .to() time.
+        # No-op here; an invalid spec raises at the .to(device) call site.
+        return
+
+
+def _resolve_load_kwargs(
+    device: Optional[str],
+    dtype: torch.dtype = torch.float16,
+) -> dict:
+    """Build ``AutoModelForCausalLM.from_pretrained`` kwargs given a device.
+
+    ``device=None`` preserves the historical accelerate dispatch path
+    (``device_map="auto"`` + a 50 GiB CPU spill ceiling). An explicit
+    device disables device_map so the model loads on host RAM, then
+    ``_post_load_to_device`` migrates it.
+
+    R9-α (2026-05-14): centralises the 4 historical load sites onto a
+    single contract so device hygiene is uniform across baseline + sweep
+    + streaming paths.
+    """
+    kwargs: dict = {
+        "dtype": dtype,
+        "low_cpu_mem_usage": True,
+    }
+    if device is None:
+        kwargs["device_map"] = "auto"
+        kwargs["max_memory"] = {"cpu": "50GiB"}
+    else:
+        _validate_device_available(device)
+        kwargs["device_map"] = None
+    return kwargs
+
+
+def _post_load_to_device(model, device: Optional[str]):
+    """Migrate a loaded model to ``device`` when explicit dispatch was used."""
+    if device is not None:
+        model.to(device)
+    return model
+
+
+def _resolve_device_used(model, device: Optional[str]) -> str:
+    """Record which device the scan ran on for provenance in ScanResult."""
+    if device is not None:
+        return device
+    try:
+        return str(next(model.parameters()).device)
+    except (StopIteration, AttributeError):
+        return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +253,34 @@ def _cache_key(model_id: str, threshold: float, ppl_headroom: float) -> str:
 
 
 def _load_cache() -> dict:
+    """Read the on-disk cache, transparently migrating from v1.0 layout.
+
+    v1.0 (legacy): entries flat at top level of the JSON object.
+    v2.0 (current): ``{"schema_version": ..., "entries": {...}}``.
+
+    Returns the entries dict regardless of on-disk format; callers see
+    a uniform mapping of cache_key → entry.
+    """
     if not CACHE_FILE.exists():
         return {}
     try:
-        return json.loads(CACHE_FILE.read_text())
+        raw = json.loads(CACHE_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
+    if isinstance(raw, dict) and "schema_version" in raw and "entries" in raw:
+        return dict(raw["entries"])
+    # v1.0 implicit — whole dict is the entries map.
+    return raw if isinstance(raw, dict) else {}
 
 
 def _save_cache(cache: dict) -> None:
+    """Persist the cache in v2.0 schema regardless of how it was loaded."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(cache, indent=2) + "\n")
+    wrapped = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "entries": cache,
+    }
+    CACHE_FILE.write_text(json.dumps(wrapped, indent=2) + "\n")
 
 
 def load_cached_result(
@@ -203,6 +311,8 @@ def load_cached_result(
         ternary_list=entry.get("ternary_list", []),
         int4_list=entry.get("int4_list", []),
         mixed_compression_ratio=entry.get("mixed_compression_ratio", 0.0),
+        # v1.0 entries lack device_used — empty string signals "unknown".
+        device_used=entry.get("device_used", ""),
     )
 
 
@@ -225,6 +335,7 @@ def _save_result(result: ScanResult, threshold: float) -> None:
         "ternary_list": result.ternary_list,
         "int4_list": result.int4_list,
         "mixed_compression_ratio": result.mixed_compression_ratio,
+        "device_used": result.device_used,
     }
     _save_cache(cache)
 
@@ -242,6 +353,8 @@ def print_scan_result(result: ScanResult) -> None:
     if result.cached:
         print(f"  (cached from {CACHE_FILE})")
     print(f"  Model:            {result.model_id}")
+    if result.device_used:
+        print(f"  Device:           {result.device_used}")
     print(f"  Layers converted: {result.layers_converted}/{result.total_eligible} "
           f"({result.pct_converted:.1f}%)")
     print(f"  Compression:      {result.compression_ratio:.2f}x")
@@ -266,6 +379,7 @@ def auto_scan(
     ppl_headroom: float = DEFAULT_PPL_HEADROOM,
     block_size: int = DEFAULT_BLOCK_SIZE,
     use_cache: bool = True,
+    device: Optional[str] = None,
 ) -> ScanResult:
     """Run a perplexity-gated sweep to find the maximum safe ternary config.
 
@@ -275,6 +389,12 @@ def auto_scan(
         ppl_headroom:  Maximum allowed PPL increase as a fraction (0.20 = 20%).
         block_size:    Number of layers to add per sweep step.
         use_cache:     If True, return cached result when available.
+        device:        Explicit device for HF model load + scan. ``None``
+                       preserves the historical accelerate dispatch
+                       (``device_map="auto"``). Pass ``"mps"`` / ``"cuda"`` /
+                       ``"cpu"`` / ``"cuda:0"`` to force explicit placement.
+                       Raises ``RuntimeError`` up front if the requested
+                       backend is unavailable. (R9-α, 2026-05-14.)
 
     Returns:
         ScanResult with the protection list and classification metadata.
@@ -291,6 +411,8 @@ def auto_scan(
             return cached
 
     print(f"Auto-scan: analysing {model_id} for safe ternary layers...")
+    if device is not None:
+        print(f"  Device: {device} (explicit)")
     t0 = time.perf_counter()
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -299,11 +421,11 @@ def auto_scan(
 
     # --- baseline ---
     base_model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.float16,
-        device_map="auto", low_cpu_mem_usage=True,
-        max_memory={"cpu": "50GiB"},
+        model_id, **_resolve_load_kwargs(device),
     )
+    base_model = _post_load_to_device(base_model, device)
     base_model.eval()
+    device_used = _resolve_device_used(base_model, device)
 
     eligible_fwd = _eligible_linear_names(base_model)
     total_eligible = len(eligible_fwd)
@@ -330,9 +452,9 @@ def auto_scan(
         protect_names = [n for n in eligible_fwd if n not in to_convert]
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.float16,
-            device_map="auto", low_cpu_mem_usage=True,
+            model_id, **_resolve_load_kwargs(device),
         )
+        model = _post_load_to_device(model, device)
         converter = MixedPrecisionConverter(
             threshold=threshold,
             protection_list=protect_names,
@@ -374,9 +496,9 @@ def auto_scan(
     if (best_n > 0 and best_n < total_eligible
             and remainder != 0 and sweep_trace[-1]["within_budget"]):
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.float16,
-            device_map="auto", low_cpu_mem_usage=True,
+            model_id, **_resolve_load_kwargs(device),
         )
+        model = _post_load_to_device(model, device)
         converter = MixedPrecisionConverter(threshold=threshold, protection_list=[])
         report = converter.convert(model)
         model.eval()
@@ -425,6 +547,7 @@ def auto_scan(
         converted_list=converted_list,
         sweep_trace=sweep_trace,
         cached=False,
+        device_used=device_used,
     )
 
     # persist
@@ -486,6 +609,7 @@ def streaming_scan(
     ppl_headroom: float = DEFAULT_PPL_HEADROOM,
     use_cache: bool = True,
     baseline_ppl: Optional[float] = None,
+    device: Optional[str] = None,
 ) -> ScanResult:
     """Streaming perplexity-gated scan using weight-space sensitivity.
 
@@ -523,6 +647,8 @@ def streaming_scan(
             return cached
 
     print(f"Streaming scan: analysing {model_id} (weight-space sensitivity)...")
+    if device is not None:
+        print(f"  Device: {device} (explicit)")
     t0 = time.perf_counter()
 
     loader = ShardedWeightIterator(model_id)
@@ -536,7 +662,7 @@ def streaming_scan(
     # --- Pass 1: baseline PPL ---
     if baseline_ppl is None:
         print("  Pass 1: computing baseline perplexity (full model load)...")
-        baseline_ppl = _streaming_baseline_ppl(model_id)
+        baseline_ppl = _streaming_baseline_ppl(model_id, device=device)
     ppl_ceiling = baseline_ppl * (1.0 + ppl_headroom)
     print(f"  Baseline PPL: {baseline_ppl:.2f}, ceiling: {ppl_ceiling:.2f} "
           f"(+{ppl_headroom:.0%})")
@@ -649,6 +775,12 @@ def streaming_scan(
     else:
         predicted_ppl = baseline_ppl
 
+    # Streaming path only loads the full model in Pass 1 for baseline PPL;
+    # subsequent sensitivity analysis is tensor-streaming so device_used
+    # records the operator-requested device, defaulting to "auto" when
+    # accelerate dispatch was used.
+    streaming_device_used = device if device is not None else "auto"
+
     result = ScanResult(
         model_id=model_id,
         baseline_ppl=round(baseline_ppl, 2),
@@ -666,6 +798,7 @@ def streaming_scan(
         ternary_list=ternary_names,
         int4_list=int4_names,
         mixed_compression_ratio=round(mixed_compression_ratio, 2),
+        device_used=streaming_device_used,
     )
 
     _save_result(result, threshold)
@@ -674,7 +807,7 @@ def streaming_scan(
     return result
 
 
-def _streaming_baseline_ppl(model_id: str) -> float:
+def _streaming_baseline_ppl(model_id: str, device: Optional[str] = None) -> float:
     """Compute baseline PPL by loading the full model with disk offloading."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -683,10 +816,9 @@ def _streaming_baseline_ppl(model_id: str) -> float:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.float16,
-        device_map="auto", low_cpu_mem_usage=True,
-        max_memory={"cpu": "50GiB"},
+        model_id, **_resolve_load_kwargs(device),
     )
+    model = _post_load_to_device(model, device)
     model.eval()
 
     ppl = _measure_perplexity(model, tokenizer)
@@ -749,6 +881,11 @@ def main():
         help="Pre-computed baseline perplexity (skips baseline model load in "
              "--streaming mode).",
     )
+    parser.add_argument(
+        "--device", type=str, default=None,
+        help="Explicit device for model load + scan (e.g. mps, cuda, cpu, cuda:0). "
+             "Default: delegate to accelerate device_map='auto'. R9-α (2026-05-14).",
+    )
 
     args = parser.parse_args()
 
@@ -763,6 +900,7 @@ def main():
                 ppl_headroom=ppl_headroom,
                 use_cache=not args.no_cache,
                 baseline_ppl=args.baseline_ppl,
+                device=args.device,
             )
         else:
             auto_scan(
@@ -771,6 +909,7 @@ def main():
                 ppl_headroom=ppl_headroom,
                 block_size=block_size,
                 use_cache=not args.no_cache,
+                device=args.device,
             )
     except KeyboardInterrupt:
         print("\nScan interrupted.")
