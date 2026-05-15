@@ -152,14 +152,15 @@ class IncrementalTQCompressor:
     encodes only newly-appended vectors on each call to `append`.
     """
 
-    def __init__(self, n_layers: int, n_heads: int, head_dim: int, device="cpu"):
+    def __init__(self, n_layers: int, n_heads: int, head_dim: int, device="cpu", b_mse: int = 3):
         sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
         from src.cache import TurboQuantConfig
 
         self.n_layers = n_layers
         self.n_heads = n_heads
+        self.b_mse = b_mse
         self.config = TurboQuantConfig(
-            d=head_dim, b_mse=3,
+            d=head_dim, b_mse=self.b_mse,
             device=torch.device(device), mixed_precision=True,
         )
         # Pre-build per-layer, per-head rotation + QJL state
@@ -219,6 +220,7 @@ class IncrementalTQCompressor:
 
 def generate_streaming_turboquant(
     model, tokenizer, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS,
+    b_mse: int = 3,
 ) -> tuple[str, float, int]:
     """Generate with KV cache + incremental TurboQuant compression.
 
@@ -258,6 +260,7 @@ def generate_streaming_turboquant(
                     n_layers=len(kv0),
                     n_heads=kv0[0][0].shape[1],
                     head_dim=kv0[0][0].shape[3],
+                    b_mse=b_mse,
                 )
 
             # Encode only the new position(s) since last call
