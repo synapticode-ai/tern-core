@@ -301,6 +301,164 @@ def make_b_mse_hook(
     return hook
 
 
+def make_b_mse_hook_uniform(
+    b_mse: int,
+    n_layers: int,
+    n_heads: int,
+    head_dim: int,
+    device: str = "cpu",
+):
+    """β1a factory: batched-(layer, head) uniform-precision round-trip hook.
+
+    R12 sweep optimization counterpart to make_b_mse_hook (the mixed-precision
+    reference factory in PR #26). Sets TurboQuantConfig(mixed_precision=False)
+    and batches encode/decode across all (n_layers × n_heads) pairs in a
+    single matmul/codebook pass — amortises the per-pair Python overhead that
+    dominates the mixed-precision reference at small L.
+
+    METHODOLOGICAL NOTE: uniform precision loses outlier-channel protection
+    that deployment configurations use. R12 sweep with this factory
+    characterises the uniform-precision headroom curve; targeted γ-supplement
+    runs (using make_b_mse_hook from PR #26) on deployment-relevant b_mse
+    points provide the mixed-precision anchors. Both datasets feed R12 v1.1
+    §8.2.
+
+    Implementation rationale: this morning's empirical probes ranked β1a as
+    the surviving optimization path after α (Triton kernels, architecturally
+    incompatible with cache.py) and β2 (torch.compile, 0.09× speedup from
+    Dynamo recompile-limit blowout on per-(layer, head) integer indexing)
+    were empirically disqualified.
+
+    Args:
+        b_mse: bits-of-MSE quantisation parameter (sweep axis for R12)
+        n_layers, n_heads, head_dim: cache shape (must match the model)
+        device: TurboQuant config device ("cpu" or "mps")
+
+    Returns:
+        Callable[(past_key_values) -> past_key_values] suitable for direct
+        injection as kv_cache_hook in R7-B v1.0 §5 autoregressive_ppl.
+    """
+    import math
+    import torch.nn.functional as F
+
+    sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
+    from src.cache import TurboQuantConfig, fwht_inplace, EPS
+
+    config = TurboQuantConfig(
+        d=head_dim, b_mse=b_mse,
+        device=torch.device(device), mixed_precision=False,
+    )
+
+    # β1a inline reimpl of TurboQuant encode/decode (uniform precision, batched (L,H)):
+    # - polarquant_encode logic: cache.py:464-548 non-mixed branch (line 532+)
+    # - qjl_encode logic: cache.py:622-634 (uses S.transpose(-1, -2), NOT S.T —
+    #   .T on 3D tensor reverses all dims, would silently misalign axes)
+    # - turboquant_decode_single logic: cache.py:821-833
+    # If cache.py upstream changes, audit this block for math drift.
+    # Phase E smoke 3 asserts numerical equivalence to per-pair cache.py calls.
+
+    LH = n_layers * n_heads
+    d = head_dim
+    d_padded = config.d_padded
+    sqrt_d_padded = math.sqrt(d_padded)
+    qjl_scale = math.sqrt(math.pi / 2) / d
+    target_device = config.device
+    codebook = config.codebook
+
+    # Stack per-(layer, head) state at factory time.
+    # Iteration order: flat_idx = layer * n_heads + head.
+    signs_stack = torch.stack([
+        config.make_rotation(l, h).signs
+        for l in range(n_layers) for h in range(n_heads)
+    ]).to(target_device).contiguous()  # [LH, d_padded] fp32
+    S_stack = torch.stack([
+        config.make_qjl_matrix(l, h)
+        for l in range(n_layers) for h in range(n_heads)
+    ]).to(target_device).contiguous()  # [LH, d, d]
+
+    def _batched_roundtrip(x_flat: torch.Tensor) -> torch.Tensor:
+        """Batched encode → residual → QJL → decode. Input/output: [LH, BT, d]."""
+        # --- polarquant_encode (non-mixed branch, batched across LH) ---
+        norm_fp16 = x_flat.norm(dim=-1).to(torch.float16)  # [LH, BT]
+        zero_mask = norm_fp16 < EPS
+        safe_norm = norm_fp16.float().clamp(min=EPS)
+        x_unit = x_flat / safe_norm.unsqueeze(-1)
+
+        if d_padded != d:
+            x_unit = F.pad(x_unit, (0, d_padded - d))
+
+        # Rotation forward inline: y = (x * signs); fwht_inplace; / sqrt_d
+        y = (x_unit * signs_stack.unsqueeze(1)).contiguous()
+        fwht_inplace(y)
+        y = y / sqrt_d_padded
+
+        indices = codebook.quantize(y)  # [LH, BT, d_padded] uint8
+        if zero_mask.any():
+            indices[zero_mask] = 0
+
+        # --- polarquant_decode (non-mixed branch, batched) ---
+        y_hat = codebook.dequantize(indices).contiguous()  # [LH, BT, d_padded] fp32
+        # Rotation inverse inline: fwht_inplace; / sqrt_d; * signs
+        fwht_inplace(y_hat)
+        z = (y_hat / sqrt_d_padded) * signs_stack.unsqueeze(1)
+        x_hat = z[..., :d] if d_padded != d else z
+        x_hat = x_hat * norm_fp16.float().unsqueeze(-1)
+        if zero_mask.any():
+            x_hat = torch.where(
+                zero_mask.unsqueeze(-1), torch.zeros_like(x_hat), x_hat
+            )
+
+        # --- residual + qjl_encode (batched, S.transpose(-1,-2) not S.T) ---
+        residual = x_flat - x_hat
+        r_norm = residual.norm(dim=-1)  # [LH, BT]
+        safe_r_norm = r_norm.clamp(min=EPS)
+        r_unit = residual / safe_r_norm.unsqueeze(-1)
+        # CRITICAL: S.transpose(-1, -2) not S.T — see comment block above.
+        projected = r_unit @ S_stack.transpose(-1, -2)  # [LH, BT, d]
+        signs_pm = torch.where(
+            projected >= 0,
+            projected.new_ones(()),
+            projected.new_full((), -1.0),
+        )  # {-1, +1}
+
+        # --- turboquant_decode_single equivalent (batched) ---
+        r_hat = (signs_pm @ S_stack) * qjl_scale * r_norm.unsqueeze(-1)
+
+        return x_hat + r_hat
+
+    def hook(past_key_values):
+        kv_pairs = _extract_kv_pairs(past_key_values)
+        batch, n_h, seq_len, hd = kv_pairs[0][0].shape
+        assert n_h == n_heads and hd == d, (
+            f"Hook expected (n_heads, head_dim)=({n_heads}, {d}), got ({n_h}, {hd})"
+        )
+        BT = batch * seq_len
+
+        # Stack across layers, permute (layers, heads) to leading dims.
+        # kv_pairs[i][j]: [batch, n_heads, seq_len, d] for layer i, key/value j.
+        k_all = torch.stack([k for k, v in kv_pairs])  # [n_layers, batch, n_heads, seq_len, d]
+        v_all = torch.stack([v for k, v in kv_pairs])
+        # → [n_layers, n_heads, batch, seq_len, d] → [LH, BT, d]
+        k_flat = k_all.permute(0, 2, 1, 3, 4).reshape(LH, BT, d).float().to(target_device)
+        v_flat = v_all.permute(0, 2, 1, 3, 4).reshape(LH, BT, d).float().to(target_device)
+
+        k_recon = _batched_roundtrip(k_flat)
+        v_recon = _batched_roundtrip(v_flat)
+
+        # Unbatch: [LH, BT, d] → [n_layers, n_heads, batch, seq_len, d]
+        #        → [n_layers, batch, n_heads, seq_len, d]
+        k_out_all = k_recon.reshape(n_layers, n_heads, batch, seq_len, d).permute(0, 2, 1, 3, 4)
+        v_out_all = v_recon.reshape(n_layers, n_heads, batch, seq_len, d).permute(0, 2, 1, 3, 4)
+
+        return tuple(
+            (k_out_all[l].contiguous().to(kv_pairs[l][0].dtype),
+             v_out_all[l].contiguous().to(kv_pairs[l][1].dtype))
+            for l in range(n_layers)
+        )
+
+    return hook
+
+
 def generate_streaming_turboquant(
     model, tokenizer, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS,
     b_mse: int = 3,
