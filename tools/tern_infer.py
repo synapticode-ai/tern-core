@@ -218,6 +218,89 @@ class IncrementalTQCompressor:
         self.seq_len = total_seq
 
 
+def make_b_mse_hook(
+    b_mse: int,
+    n_layers: int,
+    n_heads: int,
+    head_dim: int,
+    device: str = "cpu",
+):
+    """Factory producing a kv_cache_hook closure for R7-B v1.0 §5 canonical loop.
+
+    Consumed by R12 v1.0 KV-cache-compression PPL diagnostic
+    (docs/kv_cache_compression_ppl_headroom_diagnostic.md). The returned hook
+    round-trips past_key_values through encode → decode using TurboQuant
+    Algorithm 2 (unbiased — turboquant_decode_single), returning HF-shape
+    past_key_values for the next forward call in the autoregressive loop.
+
+    Round-trip body matches turboquant/src/test_real_model.py:100-135 pattern
+    with turboquant_decode_single substituted for polarquant_decode (unbiased
+    decode preserves attention inner products for PPL fidelity).
+
+    Per-sequence semantics: fresh closure per make_b_mse_hook call; the closure
+    captures per-(layer, head) rotation and QJL state. Within-sequence: each
+    hook invocation re-encodes the full past_kv (no incremental cache); cost
+    O(L) per call, O(L²) total across an L-token sequence.
+
+    Args:
+        b_mse: bits-of-MSE quantisation parameter (sweep axis for R12)
+        n_layers, n_heads, head_dim: cache shape (must match the model)
+        device: TurboQuant config device ("cpu" or "mps")
+
+    Returns:
+        Callable[(past_key_values) -> past_key_values] suitable for direct
+        injection as kv_cache_hook in R7-B v1.0 §5 autoregressive_ppl.
+    """
+    sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
+    from src.cache import (
+        TurboQuantConfig,
+        turboquant_encode_internal,
+        turboquant_decode_single,
+    )
+
+    config = TurboQuantConfig(
+        d=head_dim, b_mse=b_mse,
+        device=torch.device(device), mixed_precision=True,
+    )
+    # Pre-build per-(layer, head) rotation + QJL state once at factory time
+    rotations = [
+        [config.make_rotation(l, h) for h in range(n_heads)]
+        for l in range(n_layers)
+    ]
+    qjl_matrices = [
+        [config.make_qjl_matrix(l, h) for h in range(n_heads)]
+        for l in range(n_layers)
+    ]
+
+    def hook(past_key_values):
+        kv_pairs = _extract_kv_pairs(past_key_values)
+        new_past = []
+        for layer_idx, (k, v) in enumerate(kv_pairs):
+            batch, n_h, seq_len, hd = k.shape
+            new_k = torch.empty_like(k)
+            new_v = torch.empty_like(v)
+            for head_idx in range(n_h):
+                rotation = rotations[layer_idx][head_idx]
+                S = qjl_matrices[layer_idx][head_idx]
+                k_flat = k[:, head_idx, :, :].reshape(-1, hd).float().to(config.device)
+                v_flat = v[:, head_idx, :, :].reshape(-1, hd).float().to(config.device)
+                mixed = config.get_mixed_config(layer_idx, head_idx, k_flat)
+                k_c = turboquant_encode_internal(
+                    k_flat, config.codebook, rotation, S, mixed=mixed,
+                )
+                v_c = turboquant_encode_internal(
+                    v_flat, config.codebook, rotation, S, mixed=mixed,
+                )
+                k_recon = turboquant_decode_single(k_c)[..., :hd].contiguous()
+                v_recon = turboquant_decode_single(v_c)[..., :hd].contiguous()
+                new_k[:, head_idx] = k_recon.reshape(batch, seq_len, hd).to(k.dtype)
+                new_v[:, head_idx] = v_recon.reshape(batch, seq_len, hd).to(v.dtype)
+            new_past.append((new_k, new_v))
+        return tuple(new_past)
+
+    return hook
+
+
 def generate_streaming_turboquant(
     model, tokenizer, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS,
     b_mse: int = 3,
