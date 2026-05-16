@@ -176,11 +176,28 @@ for b_mse_value in [1, 2, 3, 4, 5, 6]:
 
 The hook receives the full `past_key_values` tuple-of-tuples (HF format: outer tuple over layers, inner tuple of (K, V)). The compression operator may mutate or replace tensors; the returned object must be a valid `past_key_values` for the next forward call.
 
+*v1.1: a batched-uniform-precision variant `make_b_mse_hook_uniform` exists for sweep-time optimization; see §5.4 and R12 v1.1 §8.2.*
+
 ### §5.3 Memory accounting
 
 Autoregressive PPL holds the full KV cache for one sequence in GPU/MPS memory throughout that sequence. For TinyLlama-1.1B at L=2048 in float16, the KV cache is ~50 MB; on Gemma 4 31B at L=2048 in float16, ~2.5 GB. Future scale-up (Gemma 4 31B, Llama 70B) will need explicit memory accounting and may require lower N or shorter L.
 
 For v1.0, the canonical TinyLlama-1.1B target fits comfortably in M4 Pro 64 GB unified memory.
+
+### §5.4 Hook factory lifetime and per-call cost expectations (v1.1 cascade)
+
+**Factory lifetime:** the `make_b_mse_hook` factory (defined in §5.2) — or its β1a variant `make_b_mse_hook_uniform` (see R12 v1.1 §8.2 for optimization path) — is constructed ONCE per sweep point. The returned hook closure is re-used across all sequences within that point. Factory build cost (the per-(layer, head) rotation + QJL state setup) is amortised across the 16 sequences of a sweep point; the captured state persists for the duration of the point.
+
+Within a single sequence, the hook fires once per generated token in the §5 canonical autoregressive loop, accumulating cost over `O(L)` per call and `O(L²)` total across an L-token sequence. See R12 v1.1 §8.2.1 for empirical L-scaling characterisation on TinyLlama-1.1B (`cost(L) ≈ 556 ms + 2.24 ms × L` for `L ≥ 512` on M4 Pro CPU).
+
+**Per-call cost expectation band:** the original R7-B v1.0 prose implicitly assumed hook cost is marginal versus the model forward pass. Empirical measurements (PR #26 mixed-precision reference, PR #27 β1a optimization, 2026-05-16 R-track session) falsify this assumption on the pure-Python TurboQuant path: hook cost is comparable to or greater than the forward pass at typical sweep `L` values. PPL evaluation wall-time is therefore the sum of forward + hook, not just forward, and first-execution budgeting MUST account for both.
+
+| Reference factory | L=64 | L=1024 | Notes |
+|---|---|---|---|
+| PR #26 — `make_b_mse_hook` (mixed-precision reference) | 699 ms | 2841 ms | M4 Pro CPU, TinyLlama-1.1B dims, `b_mse=4` |
+| PR #27 — `make_b_mse_hook_uniform` (β1a optimization) | 29 ms | 474 ms | Same hardware/model; ~6× faster at L=1024 |
+
+**Cross-architecture extrapolation discipline:** wall-time scaling at different `(n_layers, n_heads, head_dim, L)` combinations is NOT free extrapolation from TinyLlama measurements. Per-arch L-scaling MUST be empirically measured at first execution on the target arch. Pre-empirical projections in cross-arch sweep planning SHOULD be labeled as upper-bound hypotheses to be falsified during first execution, not as commitments. This discipline inherits the banked lesson surfaced in R12 v1.1 §11.
 
 ---
 
@@ -341,4 +358,29 @@ Per-model baselines are NOT optional: R12 cannot legitimately compute `ppl_headr
 
 ---
 
-*Generated 2026-05-15 — tern-core canonical methodology document. R7-B v1.0 is the autoregressive sibling to R7-A v1.0, enabling R12 KV-cache compression diagnostic. The §1.1 invariant (R7-B baseline ≈ R7-A baseline within 0.5% under no compression) is the methodology's calibration gate.*
+## §11 Change log
+
+### v1.0 → v1.1 cascade (2026-05-16) — hook lifetime + empirical cost expectations
+
+Cascade applied 2026-05-16 per surgeon ratification. All edits sourced from the 2026-05-15 to 2026-05-16 R-track sessions: PR #26 (`make_b_mse_hook` reference factory, draft), PR #27 (`make_b_mse_hook_uniform` β1a optimization factory, draft), PR #28 (R12 v1.1 cascade, draft). R7-B v1.0 §1-§4 and §6-§10 retained verbatim; §5 amended (new §5.4 sub-section; §5.2 gains a one-line v1.1 footnote pointing at §5.4 + R12 v1.1 §8.2).
+
+#### Substantive (methodology-affecting)
+
+1. **§5.4 added — hook factory lifetime + per-call cost expectations.**
+   - Factory lifetime: one factory per sweep point; hook closure re-used across all 16 sequences within the point; per-(layer, head) rotation + QJL state amortised
+   - Per-call cost: comparable to or greater than the model forward pass on the pure-Python TurboQuant path; falsifies v1.0's implicit "marginal cost" framing. PPL eval wall-time is forward + hook, not just forward.
+   - Empirical cost table at L=64 and L=1024 for both reference (PR #26: 699 / 2841 ms) and β1a (PR #27: 29 / 474 ms) factories on TinyLlama-1.1B dims, M4 Pro CPU, `b_mse=4`
+   - Cross-architecture L-scaling discipline: per-arch empirical measurement required at first execution; pre-empirical projections labeled as upper-bound hypotheses, not commitments
+
+#### Documentary (clarity / accuracy without methodology change)
+
+2. **§5.2 v1.1 footnote** — one-line pointer at end of §5.2 surfacing the existence of the β1a variant `make_b_mse_hook_uniform` and cross-referencing §5.4 + R12 v1.1 §8.2.
+3. **Footer revised** — v1.0 footer updated to v1.1 with empirical-cost cross-ref to §5.4 + inherited-banked-lesson note.
+
+#### Banked lesson inherited from R12 v1.1
+
+Pre-empirical wall-time projections in methodology specs are aspirational, not anchors (see R12 v1.1 §11). R7-B v1.0's §5 prose implicitly framed hook cost as marginal versus the model forward pass; v1.1 surfaces the empirical correction and inherits the broader discipline. Cross-arch sweeps SHOULD measure their own per-arch L-scaling at first execution rather than extrapolating from TinyLlama numbers.
+
+---
+
+*Ratified 2026-05-16 — tern-core canonical methodology document, R7-B v1.1. Autoregressive sibling to R7-A v1.0; consumed by R12 v1.1 KV-cache-compression PPL diagnostic. The §1.1 invariant (R7-B baseline ≈ R7-A baseline within 0.5% under no compression) is the methodology's calibration gate. v1.1 surfaces hook-factory lifetime + empirical per-call cost expectations (see §5.4); inherits R12 v1.1's banked lesson on pre-empirical wall-time projections.*
