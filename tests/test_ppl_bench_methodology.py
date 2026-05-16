@@ -799,18 +799,6 @@ def test_autoregressive_real_model_tinyllama_with_hook_cpu():
     except ImportError:
         pytest.skip("transformers not installed")
 
-    # tern_infer's make_b_mse_hook_uniform imports from a hardcoded local
-    # turboquant path (tern_infer.py:345). CI runners lack this path. Skip
-    # if the module isn't resolvable — carry-forward: declare turboquant as
-    # a proper pyproject.toml dep or replace hardcoded path with env-var +
-    # repo-relative fallback (affects both PR #26 and PR #27 hooks).
-    try:
-        from tern_infer import make_b_mse_hook_uniform  # noqa: F401
-    except (ImportError, ModuleNotFoundError) as e:
-        pytest.skip(
-            f"turboquant package path not available on this runner: {e}"
-        )
-
     model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
@@ -833,9 +821,18 @@ def test_autoregressive_real_model_tinyllama_with_hook_cpu():
     )
     assert len(sequences) == 1
 
-    hook, params, factory_seconds = tern_ppl_bench.build_kv_cache_hook(
-        hook_spec="uniform", b_mse=4, model=model, device=device
-    )
+    # tern_infer's hook factories use _ensure_turboquant_on_path() to locate
+    # the turboquant source directory. CI runners typically lack the canonical
+    # ../venv/src/turboquant layout AND the TURBOQUANT_DEV_PATH env-var, so
+    # the helper raises ImportError when called from build_kv_cache_hook.
+    # Skip when turboquant is unreachable; the test still runs on dev boxes
+    # where the canonical layout exists.
+    try:
+        hook, params, factory_seconds = tern_ppl_bench.build_kv_cache_hook(
+            hook_spec="uniform", b_mse=4, model=model, device=device
+        )
+    except ImportError as e:
+        pytest.skip(f"turboquant package path not available on this runner: {e}")
     assert hook is not None
     assert params["factory_name"] == "make_b_mse_hook_uniform"
     assert factory_seconds > 0  # cold path exercised
