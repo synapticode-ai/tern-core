@@ -641,22 +641,16 @@ def test_evaluate_ppl_autoregressive_float64_accumulation():
 def test_evaluate_ppl_autoregressive_kv_cache_hook_returns_modified_kv():
     """§5.2 load-bearing semantic: subsequent forward MUST use hook's return value.
 
-    The hook returns a SimpleNamespace carrying a unique marker attribute and
-    a stub get_seq_length method (so the harness's DynamicCache compat shim
-    treats it as already-Cache-shaped and passes it through unchanged). The
-    stub model records what past_kv it received; the test asserts the marker
-    is present on subsequent forward calls — proving the hook's return value
-    reaches the next forward (not a stale closure-captured copy).
+    The hook returns a unique sentinel SimpleNamespace; if that sentinel reaches
+    the next forward call, the hook's return value is being consumed correctly
+    (rather than a stale closure-captured copy). The stub model records every
+    past_kv it receives, allowing direct assertion on identity.
     """
     model = _StubCausalLMAutoregressive()
     sequences = [[1, 2, 3, 4]]  # 3 forward calls; hook fires after each
 
     def modifying_hook(past_kv):
-        marker = SimpleNamespace(
-            __marker__="HOOK_MODIFIED",
-            get_seq_length=lambda: 0,  # satisfies harness DynamicCache shim
-        )
-        return marker
+        return SimpleNamespace(__marker__="HOOK_MODIFIED")
 
     tern_ppl_bench.evaluate_ppl_autoregressive(
         model=model, sequences=sequences, kv_cache_hook=modifying_hook,
@@ -671,6 +665,42 @@ def test_evaluate_ppl_autoregressive_kv_cache_hook_returns_modified_kv():
             f"§5.2: call {i} received {received!r}; "
             f"expected hook-modified SimpleNamespace with __marker__='HOOK_MODIFIED'"
         )
+
+
+def test_factory_returns_dynamic_cache_instance():
+    """R7-B v1.1 §5.2: kv_cache_hook factories must return DynamicCache instances.
+
+    Calls make_b_mse_hook_uniform (β1a, fast cold path) with a synthetic
+    past_kv and asserts the returned object is a transformers.cache_utils.DynamicCache
+    instance per the §5.2 return contract. Skips if turboquant is unavailable.
+    """
+    _infer_path = Path(__file__).resolve().parent.parent / "tools" / "tern_infer.py"
+    _infer_spec = importlib.util.spec_from_file_location("tern_infer", _infer_path)
+    assert _infer_spec is not None and _infer_spec.loader is not None
+    tern_infer = importlib.util.module_from_spec(_infer_spec)
+    _infer_spec.loader.exec_module(tern_infer)
+
+    from transformers.cache_utils import DynamicCache
+
+    try:
+        hook = tern_infer.make_b_mse_hook_uniform(
+            b_mse=4, n_layers=2, n_heads=4, head_dim=8, device="cpu"
+        )
+    except (ImportError, ModuleNotFoundError) as e:
+        pytest.skip(f"turboquant unavailable: {e}")
+
+    # Synthetic past_kv: tuple-of-(K, V) tensor pairs, shape per factory contract.
+    synthetic_past_kv = tuple(
+        (
+            torch.randn(1, 4, 4, 8, dtype=torch.float32),
+            torch.randn(1, 4, 4, 8, dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+    result = hook(synthetic_past_kv)
+    assert isinstance(result, DynamicCache), (
+        f"§5.2: factory must return DynamicCache; got {type(result).__name__}"
+    )
 
 
 # ── R7-B §7 — output schema ────────────────────────────────────────────
