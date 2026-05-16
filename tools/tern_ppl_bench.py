@@ -58,6 +58,13 @@ DEFAULT_SEQ_LEN = 2048
 DEFAULT_STRIDE = 2048
 DEFAULT_ROLLING_STRIDE = 1024  # R7-A §5 diagnostic rolling-window variant
 
+# ── R7-B v1.1 §7 schema constants ──────────────────────────────────────
+
+SCHEMA_VERSION_AR = "wikitext2_ppl_autoregressive/1.0"
+SPEC_VERSION_AR = "wikitext2_ppl_methodology_autoregressive v1.1"
+DEFAULT_NUM_SEQUENCES = 16   # R7-B v1.0 §4 canonical N
+DEFAULT_AR_SEQ_LEN = 2048    # R7-B v1.0 §4 canonical L (matches R7-A seq_len)
+
 
 # ── R7-A §7 ppl_headroom band classification ───────────────────────────
 
@@ -131,6 +138,44 @@ def prepare_tokens(
         bos = torch.tensor([bos_token_id], dtype=tokens.dtype, device=tokens.device)
         tokens = torch.cat([bos, tokens], dim=0)
     return tokens
+
+
+# ── Sequence construction (R7-B §4) ────────────────────────────────────
+
+
+def build_sequences_autoregressive(
+    tokens: torch.Tensor,
+    num_sequences: int,
+    seq_len: int,
+    bos_token_id: Optional[int],
+) -> list[list[int]]:
+    """Build N sequences of length L from tokens per R7-B v1.0 §4.
+
+    Sequences are taken sequentially from the stream (first N×L tokens),
+    NOT randomly sampled — bit-reproducible per §4 determinism note.
+    BOS is prepended to EACH sequence when bos_token_id is not None;
+    this contrasts with R7-A's once-at-corpus-start handling because each
+    R7-B sequence is an independent autoregressive context with its own
+    KV-cache lifecycle.
+
+    Returns:
+        List of N inner lists. Each inner list is bos_token_id + L raw
+        tokens when BOS prepended, or L raw tokens otherwise. Total scored
+        positions per sequence = (len(inner) - 1) per §5 final-PPL block.
+    """
+    needed = num_sequences * seq_len
+    if int(tokens.shape[0]) < needed:
+        raise ValueError(
+            f"Insufficient tokens for R7-B §4 sequence construction: have "
+            f"{tokens.shape[0]}, need {needed} (N={num_sequences}, L={seq_len})."
+        )
+    sequences: list[list[int]] = []
+    for i in range(num_sequences):
+        chunk = tokens[i * seq_len : (i + 1) * seq_len].tolist()
+        if bos_token_id is not None:
+            chunk = [bos_token_id] + chunk
+        sequences.append(chunk)
+    return sequences
 
 
 # ── Sliding-window evaluation (R7-A §5) ────────────────────────────────
@@ -212,6 +257,125 @@ def evaluate_ppl(
         tokens_scored=total_tokens_scored,
         tokens_discarded=tokens_discarded,
         per_window_losses=per_window_losses,
+    )
+
+
+# ── Autoregressive evaluation (R7-B v1.1 §5) ───────────────────────────
+
+
+@dataclass
+class ARPplResult:
+    """Result of an R7-B autoregressive PPL pass."""
+
+    mean_loss: float
+    ppl: float
+    sequence_count: int
+    tokens_scored: int
+    total_loss_float64: float
+    eval_wall_time_seconds: float
+    per_sequence_losses: list[float]
+
+
+def evaluate_ppl_autoregressive(
+    model: Any,
+    sequences: list[list[int]],
+    kv_cache_hook: Optional[Any] = None,
+    device: str = "mps",
+) -> ARPplResult:
+    """R7-B v1.1 §5 canonical autoregressive PPL.
+
+    Per-token forward (input = single token, past_key_values carry context);
+    ``kv_cache_hook`` applied between forwards if provided; loss summed in
+    Python float (CPython double = float64) per §5 accumulator-type note;
+    final PPL = exp(total_loss / total_scored) across all N sequences per
+    §5 final-PPL block.
+
+    Args:
+        model:          HF causal LM with use_cache support.
+        sequences:      List of N sequences from build_sequences_autoregressive.
+        kv_cache_hook:  Optional callable(past_kv) -> past_kv applied between
+                        forward calls. Closure lifetime is the caller's
+                        concern (one factory per measurement per §5.4).
+        device:         Device string for tensor placement.
+    """
+    import torch.nn.functional as F
+
+    if kv_cache_hook is None:
+        kv_cache_hook = lambda kv: kv
+
+    model.eval()
+
+    total_loss: float = 0.0
+    total_scored: int = 0
+    per_sequence_losses: list[float] = []
+
+    t_start = time.perf_counter()
+    with torch.no_grad():
+        for seq in sequences:
+            past_kv = None
+            seq_loss: float = 0.0
+            L_eff = len(seq)
+            for t in range(L_eff - 1):
+                input_ids = torch.tensor([[seq[t]]], device=device)
+                outputs = model(
+                    input_ids=input_ids,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+                past_kv = outputs.past_key_values
+                past_kv = kv_cache_hook(past_kv)
+                # HF Cache-shape shim: PR #26 / PR #27 hooks return legacy
+                # tuple-of-tuples per R7-B v1.1 §5.2 docstring; current HF
+                # transformers (>= 5.x) requires Cache objects with
+                # .get_seq_length() at modeling_<arch>.py forward path.
+                # Bridge the spec's "return past_key_values" contract with
+                # HF's evolving shape via DynamicCache wrap when needed.
+                if past_kv is not None and not hasattr(past_kv, "get_seq_length"):
+                    try:
+                        from transformers.cache_utils import DynamicCache
+
+                        past_kv = DynamicCache(past_kv)
+                    except (ImportError, AttributeError, TypeError, ValueError):
+                        # Older transformers may accept tuple natively; or
+                        # synthetic-stub tests may pass non-tensor markers
+                        # that DynamicCache cannot validate. Pass through —
+                        # the next forward call will either accept or raise
+                        # meaningfully against its own expectations.
+                        pass
+
+                logits = outputs.logits[0, -1]
+                target = torch.tensor(seq[t + 1], device=device)
+                # reduction='sum' on a single-position pair gives the
+                # per-token CE; .item() casts to Python float (float64).
+                loss = F.cross_entropy(
+                    logits.unsqueeze(0),
+                    target.unsqueeze(0),
+                    reduction="sum",
+                ).item()
+                seq_loss += loss
+                total_loss += loss
+                total_scored += 1
+            per_sequence_losses.append(seq_loss)
+
+    eval_wall_time = time.perf_counter() - t_start
+
+    if total_scored == 0:
+        raise ValueError(
+            "R7-B §5 autoregressive eval scored zero tokens — empty or "
+            "single-token sequences cannot produce a PPL value."
+        )
+
+    mean_loss = total_loss / total_scored
+    ppl = math.exp(mean_loss)
+
+    return ARPplResult(
+        mean_loss=mean_loss,
+        ppl=ppl,
+        sequence_count=len(sequences),
+        tokens_scored=total_scored,
+        total_loss_float64=total_loss,
+        eval_wall_time_seconds=eval_wall_time,
+        per_sequence_losses=per_sequence_losses,
     )
 
 
@@ -428,6 +592,125 @@ def build_results_json(
     }
 
 
+def build_results_json_autoregressive(
+    *,
+    model_id: str,
+    dtype: str,
+    device: str,
+    tokenizer_source: str,
+    bos_token_id: Optional[int],
+    vocab_size: int,
+    dataset_revision: Optional[str],
+    sequence_length: int,
+    sequence_count: int,
+    kv_cache_hook_enabled: bool,
+    kv_cache_hook_spec: str,
+    kv_cache_hook_parameters: dict,
+    factory_build_seconds: float,
+    model_load_seconds: float,
+    eval_result: ARPplResult,
+    comparison_baseline_run_id: Optional[str] = None,
+    comparison_baseline_ppl: Optional[float] = None,
+    comparison_baseline_methodology: Optional[str] = None,
+    notes: str = "",
+    run_id: Optional[str] = None,
+) -> dict:
+    """Build a dict conformant to wikitext2_ppl_autoregressive/1.0 (R7-B §7)."""
+    if comparison_baseline_ppl is not None and comparison_baseline_ppl > 0:
+        ppl_headroom = (
+            eval_result.ppl - comparison_baseline_ppl
+        ) / comparison_baseline_ppl
+        ppl_headroom_band: Optional[str] = classify_ppl_headroom_band(ppl_headroom)
+    else:
+        ppl_headroom = None
+        ppl_headroom_band = None
+
+    try:
+        import transformers as _tx
+
+        transformers_version = _tx.__version__
+    except ImportError:
+        transformers_version = "unknown"
+
+    tokens_per_second = (
+        eval_result.tokens_scored / eval_result.eval_wall_time_seconds
+        if eval_result.eval_wall_time_seconds > 0
+        else 0.0
+    )
+
+    return {
+        "schema_version": SCHEMA_VERSION_AR,
+        "run_id": run_id or utc_now_compact(),
+        "tern_core_version": terncore.__version__,
+        "tern_core_git_commit": git_commit_short(),
+        "spec_version": SPEC_VERSION_AR,
+        "model": {
+            "model_id": model_id,
+            "huggingface_revision": None,  # populated by caller if resolvable
+            "dtype": dtype,
+            "device": device,
+        },
+        "tokeniser": {
+            "tokenizer_id": tokenizer_source,
+            "bos_token_id": bos_token_id,
+            "vocab_size": vocab_size,
+        },
+        "dataset": {
+            "name": WIKITEXT_CONFIG,
+            "split": WIKITEXT_SPLIT,
+            "dataset_revision": dataset_revision,
+        },
+        "config": {
+            "sequence_length": sequence_length,
+            "sequence_count": sequence_count,
+            "stride_between_sequences": sequence_length,  # R7-B §4: non-overlapping
+            "bos_handling": (
+                "prepend_per_sequence" if bos_token_id is not None else "none"
+            ),
+            "eos_insertion": "none",
+            "kv_cache_compression": {
+                "enabled": kv_cache_hook_enabled,
+                "hook_spec": kv_cache_hook_spec,
+                "parameters": kv_cache_hook_parameters,
+            },
+        },
+        "results": {
+            "total_loss_float64": eval_result.total_loss_float64,
+            "tokens_scored": eval_result.tokens_scored,
+            "mean_loss": round(eval_result.mean_loss, 6),
+            "ppl_autoregressive": round(eval_result.ppl, 4),
+            "per_sequence_losses": [
+                round(x, 6) for x in eval_result.per_sequence_losses
+            ],
+        },
+        "comparison": {
+            "baseline_run_id": comparison_baseline_run_id,
+            "baseline_ppl": (
+                round(comparison_baseline_ppl, 4)
+                if comparison_baseline_ppl is not None
+                else None
+            ),
+            "baseline_methodology": comparison_baseline_methodology,
+            "ppl_headroom": (
+                round(ppl_headroom, 4) if ppl_headroom is not None else None
+            ),
+            "ppl_headroom_band": ppl_headroom_band,
+        },
+        "timing": {
+            "model_load_seconds": round(model_load_seconds, 2),
+            "factory_build_seconds": round(factory_build_seconds, 3),
+            "eval_wall_time_seconds": round(eval_result.eval_wall_time_seconds, 2),
+            "tokens_per_second": round(tokens_per_second, 2),
+        },
+        "hardware": {
+            "device": device,
+            "torch_version": torch.__version__,
+            "transformers_version": transformers_version,
+        },
+        "notes": notes,
+    }
+
+
 def model_short_label(variant: str, model_id: str, tern_path: Optional[Path]) -> str:
     """Derive the <model_short> portion of the canonical output filename."""
     if variant == "ternary" and tern_path is not None:
@@ -435,6 +718,79 @@ def model_short_label(variant: str, model_id: str, tern_path: Optional[Path]) ->
         # If parent dir name carries the canonical short label, prefer it.
         return tern_path.parent.name if tern_path.parent.name else stem
     return model_id.rsplit("/", 1)[-1].lower()
+
+
+# ── KV-cache hook factory selection (R12 v1.1 §8.2 / R7-B v1.1 §5.4) ───
+
+
+def build_kv_cache_hook(
+    hook_spec: str,
+    b_mse: int,
+    model: Any,
+    device: str,
+) -> tuple[Optional[Any], dict, float]:
+    """Construct an R12 kv_cache_hook + capture factory build time (Q6).
+
+    Args:
+        hook_spec: ``"none"`` | ``"mixed"`` | ``"uniform"``.
+        b_mse:     bits-of-MSE parameter when hook_spec != ``"none"``.
+        model:     loaded HF causal LM (for ``model.config`` reflection).
+        device:    target device for the hook's TurboQuant operations.
+
+    Returns:
+        (hook, parameters_dict, factory_build_seconds). When hook_spec is
+        ``"none"``, returns (None, {}, 0.0). For ``"mixed"`` / ``"uniform"``,
+        imports the factory from ``tools.tern_infer`` and times the call.
+
+    Note: ``"mixed"`` factory has a lazy outlier-detection cold cost on
+    first hook invocation (~10 min on TinyLlama per R12 v1.1 §8.2.1), not
+    captured in factory_build_seconds. ``"uniform"`` (β1a) has near-zero
+    cold cost because ``mixed_precision=False`` short-circuits the lazy path.
+    """
+    if hook_spec == "none":
+        return None, {}, 0.0
+
+    # Reflect cache geometry from model.config — see R12 v1.1 §8.2.4.
+    cfg = model.config
+    n_layers = int(cfg.num_hidden_layers)
+    n_heads = int(getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads)
+    head_dim = int(cfg.hidden_size // cfg.num_attention_heads)
+
+    # Late import to avoid pulling tern_infer's deps on R7-A paths.
+    _tools_dir = str(Path(__file__).resolve().parent)
+    if _tools_dir not in sys.path:
+        sys.path.insert(0, _tools_dir)
+    from tern_infer import make_b_mse_hook, make_b_mse_hook_uniform  # noqa: E402
+
+    if hook_spec == "mixed":
+        factory = make_b_mse_hook
+    elif hook_spec == "uniform":
+        factory = make_b_mse_hook_uniform
+    else:
+        raise ValueError(
+            f"Unknown hook_spec={hook_spec!r}; expected one of "
+            f"'none', 'mixed', 'uniform'."
+        )
+
+    t0 = time.perf_counter()
+    hook = factory(
+        b_mse=b_mse,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        device=device,
+    )
+    factory_build_seconds = time.perf_counter() - t0
+
+    parameters = {
+        "b_mse": b_mse,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "head_dim": head_dim,
+        "device": device,
+        "factory_name": factory.__name__,
+    }
+    return hook, parameters, factory_build_seconds
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -527,12 +883,61 @@ def main() -> None:
         help="Omit results.per_window_losses array (smaller JSON)",
     )
 
+    # ── R7-B v1.1 §5 / R12 v1.1 §8.2 — autoregressive methodology flags ─
+    parser.add_argument(
+        "--methodology",
+        choices=["sliding", "autoregressive"],
+        default="sliding",
+        help="R7-A sliding-window (default) or R7-B v1.1 autoregressive",
+    )
+    parser.add_argument(
+        "--num-sequences",
+        type=int,
+        default=DEFAULT_NUM_SEQUENCES,
+        help="R7-B v1.0 §4 N (default 16)",
+    )
+    parser.add_argument(
+        "--ar-seq-len",
+        type=int,
+        default=DEFAULT_AR_SEQ_LEN,
+        help="R7-B v1.0 §4 L (default 2048)",
+    )
+    parser.add_argument(
+        "--kv-cache-hook",
+        choices=["none", "mixed", "uniform"],
+        default="none",
+        help=(
+            "R12 KV-cache compression hook: none (baseline), mixed "
+            "(make_b_mse_hook reference factory, PR #26), uniform "
+            "(make_b_mse_hook_uniform β1a factory, PR #27)"
+        ),
+    )
+    parser.add_argument(
+        "--b-mse",
+        type=int,
+        default=4,
+        help="b_mse parameter when --kv-cache-hook != none (default 4)",
+    )
+
     args = parser.parse_args()
 
     is_ternary = args.tern_model_path is not None
     variant = "ternary" if is_ternary else "fp16"
+    methodology = args.methodology
 
-    print(f"[tern_ppl_bench] R7-A v1.0 — variant={variant}")
+    # Resolve output-dir default per methodology if user did not override.
+    _r7a_default_dir = (
+        Path(__file__).resolve().parent.parent / "results" / "wikitext2_ppl"
+    )
+    if methodology == "autoregressive" and args.output_dir == _r7a_default_dir:
+        args.output_dir = (
+            Path(__file__).resolve().parent.parent
+            / "results"
+            / "wikitext2_ppl_autoregressive"
+        )
+
+    methodology_tag = "R7-A v1.0" if methodology == "sliding" else "R7-B v1.1"
+    print(f"[tern_ppl_bench] {methodology_tag} — variant={variant}")
     t_load = time.perf_counter()
 
     if is_ternary:
@@ -558,7 +963,8 @@ def main() -> None:
         dtype_activation = "float16"
 
     tokenizer_source = args.tokenizer or model_id
-    print(f"[tern_ppl_bench]   model loaded in {time.perf_counter() - t_load:.1f}s")
+    model_load_seconds = time.perf_counter() - t_load
+    print(f"[tern_ppl_bench]   model loaded in {model_load_seconds:.1f}s")
 
     # ── Dataset + tokens ────────────────────────────────────────────
     print("[tern_ppl_bench]   loading WikiText-2 test split...")
@@ -572,75 +978,166 @@ def main() -> None:
         f"(bos_prepended={bos_prepended})"
     )
 
-    # ── Headline eval ──────────────────────────────────────────────
-    print(
-        f"[tern_ppl_bench]   eval: seq_len={args.seq_len}, stride={args.stride}"
-    )
-    t_eval = time.perf_counter()
-    result = evaluate_ppl(
-        model=model,
-        tokens=tokens,
-        seq_len=args.seq_len,
-        stride=args.stride,
-        device=args.device,
-    )
-    print(
-        f"[tern_ppl_bench]   PPL = {result.ppl:.4f} "
-        f"(windows={result.windows_evaluated}, "
-        f"scored={result.tokens_scored:,}, "
-        f"discarded={result.tokens_discarded}, "
-        f"{time.perf_counter() - t_eval:.1f}s)"
-    )
-
-    # ── Optional rolling-window diagnostic ──────────────────────────
-    ppl_rolling: Optional[float] = None
-    if args.rolling_variant:
+    if methodology == "sliding":
+        # ── R7-A v1.0 sliding-window headline eval ────────────────────
         print(
-            f"[tern_ppl_bench]   rolling-variant pass: stride={args.rolling_stride}"
+            f"[tern_ppl_bench]   eval: seq_len={args.seq_len}, stride={args.stride}"
         )
-        rolling = evaluate_ppl(
+        t_eval = time.perf_counter()
+        result = evaluate_ppl(
             model=model,
             tokens=tokens,
             seq_len=args.seq_len,
-            stride=args.rolling_stride,
+            stride=args.stride,
             device=args.device,
         )
-        ppl_rolling = rolling.ppl
-        print(f"[tern_ppl_bench]   PPL (rolling) = {rolling.ppl:.4f}")
+        print(
+            f"[tern_ppl_bench]   PPL = {result.ppl:.4f} "
+            f"(windows={result.windows_evaluated}, "
+            f"scored={result.tokens_scored:,}, "
+            f"discarded={result.tokens_discarded}, "
+            f"{time.perf_counter() - t_eval:.1f}s)"
+        )
 
-    # ── Assemble + persist JSON ────────────────────────────────────
-    record = build_results_json(
-        variant=variant,
+        # Optional rolling-window diagnostic
+        ppl_rolling: Optional[float] = None
+        if args.rolling_variant:
+            print(
+                f"[tern_ppl_bench]   rolling-variant pass: stride={args.rolling_stride}"
+            )
+            rolling = evaluate_ppl(
+                model=model,
+                tokens=tokens,
+                seq_len=args.seq_len,
+                stride=args.rolling_stride,
+                device=args.device,
+            )
+            ppl_rolling = rolling.ppl
+            print(f"[tern_ppl_bench]   PPL (rolling) = {rolling.ppl:.4f}")
+
+        # Assemble + persist R7-A JSON
+        record = build_results_json(
+            variant=variant,
+            model_id=model_id,
+            source_path=source_path,
+            tern_model_manifest_sha256=manifest_sha,
+            tokenizer_source=tokenizer_source,
+            bos_token_id=bos_token_id,
+            bos_prepended=bos_prepended,
+            huggingface_revision=hf_revision,
+            total_tokens=int(tokens.shape[0]),
+            seq_len=args.seq_len,
+            stride=args.stride,
+            rolling_variant_included=args.rolling_variant,
+            device=args.device,
+            dtype_activation=dtype_activation,
+            batch_size=1,
+            eval_result=result,
+            ppl_rolling=ppl_rolling,
+            comparison_baseline_run_id=args.baseline_run_id,
+            comparison_baseline_ppl=args.baseline_ppl,
+            notes=args.notes,
+            store_per_window_losses=not args.no_per_window_losses,
+        )
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        short = model_short_label(variant, model_id, args.tern_model_path)
+        out_path = (
+            args.output_dir / f"ppl_{short}_{variant}_{record['run_id']}.json"
+        )
+        out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+        print(f"[tern_ppl_bench]   wrote {out_path}")
+        print(f"[tern_ppl_bench]   run_id = {record['run_id']}")
+        print(f"[tern_ppl_bench]   ppl    = {record['results']['ppl']}")
+        return
+
+    # ── R7-B v1.1 §5 autoregressive eval ────────────────────────────
+    print(
+        f"[tern_ppl_bench]   eval: N={args.num_sequences}, L={args.ar_seq_len} "
+        f"(R7-B v1.1 §4 — non-overlapping, BOS-per-sequence={bos_prepended})"
+    )
+    sequences = build_sequences_autoregressive(
+        tokens=tokens,
+        num_sequences=args.num_sequences,
+        seq_len=args.ar_seq_len,
+        bos_token_id=bos_token_id,
+    )
+
+    # Construct kv_cache_hook (factory build time captured for Q6 visibility).
+    hook, hook_parameters, factory_build_seconds = build_kv_cache_hook(
+        hook_spec=args.kv_cache_hook,
+        b_mse=args.b_mse,
+        model=model,
+        device=args.device,
+    )
+    hook_enabled = hook is not None
+    if hook_enabled:
+        print(
+            f"[tern_ppl_bench]   factory build: {factory_build_seconds:.2f}s "
+            f"({hook_parameters['factory_name']}, b_mse={args.b_mse})"
+        )
+        if args.kv_cache_hook == "mixed":
+            print(
+                "[tern_ppl_bench]     note: first-call may include lazy cold "
+                "warmup for mixed; see R12 v1.1 §8.2.1"
+            )
+
+    ar_result = evaluate_ppl_autoregressive(
+        model=model,
+        sequences=sequences,
+        kv_cache_hook=hook,
+        device=args.device,
+    )
+    tokens_per_second = (
+        ar_result.tokens_scored / ar_result.eval_wall_time_seconds
+        if ar_result.eval_wall_time_seconds > 0
+        else 0.0
+    )
+    print(
+        f"[tern_ppl_bench]   PPL (autoregressive) = {ar_result.ppl:.4f} "
+        f"(sequences={ar_result.sequence_count}, "
+        f"scored={ar_result.tokens_scored:,}, "
+        f"{ar_result.eval_wall_time_seconds:.1f}s, "
+        f"{tokens_per_second:.1f} tok/s)"
+    )
+
+    # Vocab size best-effort from tokenizer
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0)) or len(
+        getattr(tokenizer, "get_vocab", lambda: {})() or {}
+    )
+
+    record = build_results_json_autoregressive(
         model_id=model_id,
-        source_path=source_path,
-        tern_model_manifest_sha256=manifest_sha,
+        dtype="float16" if not is_ternary else "mixed",
+        device=args.device,
         tokenizer_source=tokenizer_source,
         bos_token_id=bos_token_id,
-        bos_prepended=bos_prepended,
-        huggingface_revision=hf_revision,
-        total_tokens=int(tokens.shape[0]),
-        seq_len=args.seq_len,
-        stride=args.stride,
-        rolling_variant_included=args.rolling_variant,
-        device=args.device,
-        dtype_activation=dtype_activation,
-        batch_size=1,
-        eval_result=result,
-        ppl_rolling=ppl_rolling,
+        vocab_size=vocab_size,
+        dataset_revision=hf_revision,
+        sequence_length=args.ar_seq_len,
+        sequence_count=args.num_sequences,
+        kv_cache_hook_enabled=hook_enabled,
+        kv_cache_hook_spec=args.kv_cache_hook,
+        kv_cache_hook_parameters=hook_parameters,
+        factory_build_seconds=factory_build_seconds,
+        model_load_seconds=model_load_seconds,
+        eval_result=ar_result,
         comparison_baseline_run_id=args.baseline_run_id,
         comparison_baseline_ppl=args.baseline_ppl,
+        comparison_baseline_methodology=None,
         notes=args.notes,
-        store_per_window_losses=not args.no_per_window_losses,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     short = model_short_label(variant, model_id, args.tern_model_path)
-    out_path = args.output_dir / f"ppl_{short}_{variant}_{record['run_id']}.json"
+    dtype_tag = "ternary" if is_ternary else "fp16"
+    out_path = args.output_dir / f"ppl_ar_{short}_{dtype_tag}_{record['run_id']}.json"
     out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
     print(f"[tern_ppl_bench]   wrote {out_path}")
     print(f"[tern_ppl_bench]   run_id = {record['run_id']}")
-    print(f"[tern_ppl_bench]   ppl    = {record['results']['ppl']}")
+    print(f"[tern_ppl_bench]   ppl_ar = {record['results']['ppl_autoregressive']}")
 
 
 if __name__ == "__main__":
