@@ -494,3 +494,365 @@ def test_fp16_baseline_tinyllama_smoke():
     assert result.windows_evaluated == 2
     assert math.isfinite(result.ppl)
     assert result.tokens_discarded == 500
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R7-B v1.1 §5 autoregressive methodology conformance tests
+# ══════════════════════════════════════════════════════════════════════
+
+
+class _StubCausalLMAutoregressive:
+    """HF-CausalLM stub supporting past_key_values / use_cache semantics.
+
+    Returns SimpleNamespace(logits=..., past_key_values=...). past_kv carries
+    a simple counter so tests can detect hook-modification round-tripping.
+    """
+
+    def __init__(self, vocab_size: int = 64, hidden: int = 8) -> None:
+        torch.manual_seed(0)
+        self.vocab_size = vocab_size
+        self.embed = torch.nn.Embedding(vocab_size, hidden)
+        self.lm_head = torch.nn.Linear(hidden, vocab_size, bias=False)
+        for p in list(self.embed.parameters()) + list(self.lm_head.parameters()):
+            p.requires_grad_(False)
+        self.received_past_kvs: list = []  # diagnostic for hook tests
+
+    def eval(self):
+        return self
+
+    def to(self, _device):
+        return self
+
+    def __call__(self, input_ids, past_key_values=None, use_cache=True):
+        self.received_past_kvs.append(past_key_values)
+        hidden = self.embed(input_ids)
+        logits = self.lm_head(hidden)  # (1, 1, vocab)
+        # Stub past_kv: increment counter at slot 0, position 0 of layer 0.
+        # Tolerate non-int markers (used by hook-modification semantic test).
+        prev_n = 0
+        if isinstance(past_key_values, tuple) and past_key_values:
+            try:
+                prev_n = int(past_key_values[0][0])
+            except (TypeError, ValueError):
+                prev_n = 0  # marker-tagged kv from hook test; reset counter
+        new_past = ((prev_n + 1, None),)
+        return SimpleNamespace(logits=logits, past_key_values=new_past)
+
+
+# ── R7-B §4 — sequence construction ────────────────────────────────────
+
+
+def test_build_sequences_autoregressive_bos_per_sequence():
+    """§4: BOS prepended to EACH sequence (not once like R7-A)."""
+    tokens = torch.arange(100, dtype=torch.long)
+    seqs = tern_ppl_bench.build_sequences_autoregressive(
+        tokens=tokens, num_sequences=3, seq_len=10, bos_token_id=99
+    )
+    assert len(seqs) == 3
+    for seq in seqs:
+        assert seq[0] == 99, "§4: BOS must be at position 0 of each sequence"
+        assert len(seq) == 11, "§4: BOS + L tokens = L+1 elements"
+
+
+def test_build_sequences_autoregressive_count_and_length():
+    """§4: N sequences of length L (no BOS)."""
+    tokens = torch.arange(200, dtype=torch.long)
+    seqs = tern_ppl_bench.build_sequences_autoregressive(
+        tokens=tokens, num_sequences=5, seq_len=20, bos_token_id=None
+    )
+    assert len(seqs) == 5
+    assert all(len(s) == 20 for s in seqs)
+
+
+def test_build_sequences_autoregressive_sequential_not_random():
+    """§4 determinism note: sequences are sequential, not random."""
+    tokens = torch.arange(60, dtype=torch.long)
+    seqs = tern_ppl_bench.build_sequences_autoregressive(
+        tokens=tokens, num_sequences=3, seq_len=20, bos_token_id=None
+    )
+    # First seq starts at token 0; second at 20; third at 40.
+    assert seqs[0][0] == 0 and seqs[0][-1] == 19
+    assert seqs[1][0] == 20 and seqs[1][-1] == 39
+    assert seqs[2][0] == 40 and seqs[2][-1] == 59
+
+
+def test_build_sequences_autoregressive_insufficient_tokens_raises():
+    """§4: must have N*L tokens available."""
+    tokens = torch.arange(10, dtype=torch.long)
+    with pytest.raises(ValueError, match="Insufficient tokens"):
+        tern_ppl_bench.build_sequences_autoregressive(
+            tokens=tokens, num_sequences=5, seq_len=10, bos_token_id=None
+        )
+
+
+# ── R7-B §5 — canonical autoregressive loop ────────────────────────────
+
+
+def test_evaluate_ppl_autoregressive_hook_called_per_token():
+    """§5: hook fires once per generated token; (L-1) per sequence × N total."""
+    model = _StubCausalLMAutoregressive()
+    sequences = [[1, 2, 3, 4], [5, 6, 7]]  # L_eff=4 and 3 → (3+2)=5 hook calls
+    hook_calls = []
+
+    def hook(past_kv):
+        hook_calls.append(past_kv)
+        return past_kv
+
+    result = tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model, sequences=sequences, kv_cache_hook=hook, device="cpu"
+    )
+    expected_calls = sum(len(s) - 1 for s in sequences)
+    assert len(hook_calls) == expected_calls, (
+        f"§5: hook called {len(hook_calls)} times; expected (L_eff-1)*N = "
+        f"{expected_calls} for {[len(s) for s in sequences]}"
+    )
+    assert result.tokens_scored == expected_calls
+
+
+def test_evaluate_ppl_autoregressive_no_hook_identity():
+    """§5: kv_cache_hook=None must behave as identity (no compression)."""
+    model_a = _StubCausalLMAutoregressive()
+    model_b = _StubCausalLMAutoregressive()
+    sequences = [[1, 2, 3, 4]]
+
+    r_none = tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model_a, sequences=sequences, kv_cache_hook=None, device="cpu"
+    )
+    r_identity = tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model_b, sequences=sequences, kv_cache_hook=lambda kv: kv,
+        device="cpu",
+    )
+    assert math.isclose(r_none.ppl, r_identity.ppl, rel_tol=1e-9)
+    assert r_none.tokens_scored == r_identity.tokens_scored
+
+
+def test_evaluate_ppl_autoregressive_float64_accumulation():
+    """§5: loss accumulator is Python float (CPython double = float64)."""
+    model = _StubCausalLMAutoregressive()
+    sequences = [[1, 2, 3, 4]]
+    result = tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model, sequences=sequences, kv_cache_hook=None, device="cpu"
+    )
+    assert isinstance(result.total_loss_float64, float)
+    assert isinstance(result.mean_loss, float)
+    assert math.isfinite(result.ppl)
+
+
+def test_evaluate_ppl_autoregressive_kv_cache_hook_returns_modified_kv():
+    """§5.2 load-bearing semantic: subsequent forward MUST use hook's return value.
+
+    The hook returns a SimpleNamespace carrying a unique marker attribute and
+    a stub get_seq_length method (so the harness's DynamicCache compat shim
+    treats it as already-Cache-shaped and passes it through unchanged). The
+    stub model records what past_kv it received; the test asserts the marker
+    is present on subsequent forward calls — proving the hook's return value
+    reaches the next forward (not a stale closure-captured copy).
+    """
+    model = _StubCausalLMAutoregressive()
+    sequences = [[1, 2, 3, 4]]  # 3 forward calls; hook fires after each
+
+    def modifying_hook(past_kv):
+        marker = SimpleNamespace(
+            __marker__="HOOK_MODIFIED",
+            get_seq_length=lambda: 0,  # satisfies harness DynamicCache shim
+        )
+        return marker
+
+    tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model, sequences=sequences, kv_cache_hook=modifying_hook,
+        device="cpu",
+    )
+    # First call: past_kv is None (no hook fired yet)
+    assert model.received_past_kvs[0] is None
+    # Calls 2 and 3: past_kv MUST carry the hook's marker
+    for i in (1, 2):
+        received = model.received_past_kvs[i]
+        assert getattr(received, "__marker__", None) == "HOOK_MODIFIED", (
+            f"§5.2: call {i} received {received!r}; "
+            f"expected hook-modified SimpleNamespace with __marker__='HOOK_MODIFIED'"
+        )
+
+
+# ── R7-B §7 — output schema ────────────────────────────────────────────
+
+
+def _make_ar_eval_result_for_schema() -> "tern_ppl_bench.ARPplResult":
+    return tern_ppl_bench.ARPplResult(
+        mean_loss=2.0,
+        ppl=math.exp(2.0),
+        sequence_count=2,
+        tokens_scored=10,
+        total_loss_float64=20.0,
+        eval_wall_time_seconds=1.5,
+        per_sequence_losses=[10.0, 10.0],
+    )
+
+
+def test_build_results_json_autoregressive_schema_keys():
+    """§7: required top-level + nested keys present for wikitext2_ppl_autoregressive/1.0."""
+    record = tern_ppl_bench.build_results_json_autoregressive(
+        model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        dtype="float16",
+        device="mps",
+        tokenizer_source="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        bos_token_id=1,
+        vocab_size=32000,
+        dataset_revision="abc123",
+        sequence_length=2048,
+        sequence_count=16,
+        kv_cache_hook_enabled=False,
+        kv_cache_hook_spec="none",
+        kv_cache_hook_parameters={},
+        factory_build_seconds=0.0,
+        model_load_seconds=12.3,
+        eval_result=_make_ar_eval_result_for_schema(),
+    )
+    top_keys = {
+        "schema_version", "run_id", "tern_core_version", "tern_core_git_commit",
+        "spec_version", "model", "tokeniser", "dataset", "config", "results",
+        "comparison", "timing", "hardware", "notes",
+    }
+    assert set(record.keys()) >= top_keys
+    assert record["schema_version"] == "wikitext2_ppl_autoregressive/1.0"
+    assert record["results"]["ppl_autoregressive"] is not None
+    assert "factory_build_seconds" in record["timing"]
+    assert "kv_cache_compression" in record["config"]
+
+
+# ── R12 §8.2 — kv_cache_hook factory selection ─────────────────────────
+
+
+def test_build_kv_cache_hook_none_returns_identity_tuple():
+    """hook_spec='none' → (None, {}, 0.0) without touching model.config."""
+    # No model needed when hook_spec == "none"
+    hook, params, secs = tern_ppl_bench.build_kv_cache_hook(
+        hook_spec="none", b_mse=4, model=None, device="cpu"
+    )
+    assert hook is None
+    assert params == {}
+    assert secs == 0.0
+
+
+# ── R7-B real-model @pytest.mark.slow integration tests ────────────────
+
+
+@pytest.mark.slow
+def test_autoregressive_real_model_tinyllama_no_hook():
+    """Slow: TinyLlama-1.1B FP16 R7-B canonical loop, no hook.
+
+    Validates harness end-to-end against a real model on MPS (the default
+    device for R-track work). Hook+MPS validation is explicitly deferred
+    to the post-A' MPS-validation phase per Q3 disposition.
+    """
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError:
+        pytest.skip("transformers not installed")
+
+    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
+    )
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    model = model.to(device)
+    model.eval()
+
+    # Synthetic stream just long enough for N=2 sequences of L=128.
+    test_text = "The quick brown fox jumps over the lazy dog. " * 200
+    tokens = tern_ppl_bench.prepare_tokens(
+        test_text, tokenizer, bos_token_id=tokenizer.bos_token_id
+    )
+    sequences = tern_ppl_bench.build_sequences_autoregressive(
+        tokens=tokens,
+        num_sequences=2,
+        seq_len=128,
+        bos_token_id=tokenizer.bos_token_id,
+    )
+    assert len(sequences) == 2
+
+    result = tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model, sequences=sequences, kv_cache_hook=None, device=device
+    )
+    assert math.isfinite(result.ppl)
+    assert result.ppl > 0
+    assert result.sequence_count == 2
+    assert result.tokens_scored == 2 * 128  # (BOS + 128) - 1 scored × 2 sequences
+    print(
+        f"[smoke] R7-B no-hook on {device}: ppl={result.ppl:.4f} "
+        f"wall={result.eval_wall_time_seconds:.1f}s"
+    )
+
+
+@pytest.mark.slow
+def test_autoregressive_real_model_tinyllama_with_hook_cpu():
+    """Slow: TinyLlama-1.1B FP16 R7-B with β1a hook on CPU.
+
+    Anchors harness-correctness with the hook-integration path exercised
+    against a real model, without entangling MPS-residency questions.
+    Hook+MPS validation explicitly deferred to post-A' MPS-validation phase
+    per Q3 disposition. β1a chosen for near-zero cold cost (mixed_precision
+    =False short-circuits the lazy outlier-detection per R12 v1.1 §8.2.1).
+    """
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError:
+        pytest.skip("transformers not installed")
+
+    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
+    )
+    device = "cpu"  # Q3: hook+MPS deferred to post-A' MPS-validation phase
+    model = model.to(device)
+    model.eval()
+
+    # N=1 sequence of L=64 — minimal real-model exercise, ~2-3 min budget.
+    test_text = "The quick brown fox jumps over the lazy dog. " * 50
+    tokens = tern_ppl_bench.prepare_tokens(
+        test_text, tokenizer, bos_token_id=tokenizer.bos_token_id
+    )
+    sequences = tern_ppl_bench.build_sequences_autoregressive(
+        tokens=tokens,
+        num_sequences=1,
+        seq_len=64,
+        bos_token_id=tokenizer.bos_token_id,
+    )
+    assert len(sequences) == 1
+
+    hook, params, factory_seconds = tern_ppl_bench.build_kv_cache_hook(
+        hook_spec="uniform", b_mse=4, model=model, device=device
+    )
+    assert hook is not None
+    assert params["factory_name"] == "make_b_mse_hook_uniform"
+    assert factory_seconds > 0  # cold path exercised
+    print(
+        f"[smoke] β1a factory build on {device}: {factory_seconds:.2f}s "
+        f"(b_mse=4, n_layers={params['n_layers']}, n_heads={params['n_heads']}, "
+        f"head_dim={params['head_dim']})"
+    )
+
+    # Wrap hook to count invocations and verify §5 cadence
+    call_count = {"n": 0}
+
+    def counting_hook(past_kv):
+        call_count["n"] += 1
+        return hook(past_kv)
+
+    result = tern_ppl_bench.evaluate_ppl_autoregressive(
+        model=model, sequences=sequences, kv_cache_hook=counting_hook,
+        device=device,
+    )
+    expected_calls = sum(len(s) - 1 for s in sequences)
+    assert call_count["n"] == expected_calls, (
+        f"§5 hook cadence: counted {call_count['n']}; expected {expected_calls}"
+    )
+    assert math.isfinite(result.ppl)
+    assert result.ppl > 0
+    assert result.tokens_scored == 64  # (BOS + 64) - 1 = 64 scored
+    print(
+        f"[smoke] R7-B β1a-hook on {device}: ppl={result.ppl:.4f} "
+        f"wall={result.eval_wall_time_seconds:.1f}s "
+        f"factory={factory_seconds:.2f}s"
+    )
