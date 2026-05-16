@@ -270,7 +270,7 @@ The canonical first execution of R12 v1.0 is a `b_mse` sweep on TinyLlama-1.1B w
 
 - Shares calibration target with R8 v1.1 first execution; enables direct cross-diagnostic comparison on a single model
 - R7-B autoregressive PPL cycle is ~27 min per point on M4 Pro MPS
-- 6-point sweep fits in ~3 hours wall time
+- Wall-time characterisation moved to §8.2 (β1a ~26 hr, γ pure-Python ~157 hr; cascaded from 2026-05-16 empirical probes)
 - Re-establishes the `b_mse=3` empirical anchor (retired from the 12 May TQ bench per R7-B §1.2) under R7-B-conformant methodology
 
 **First-execution parameters:**
@@ -318,6 +318,63 @@ As of 2026-05-15 (verified against `tools/tern_infer.py:148` on `main`), `Increm
 - Author `make_b_mse_hook(b_mse: int) -> Callable[[past_kv], past_kv]` factory per R7-B v1.0 §5.2 to construct the appropriate `kv_cache_hook` callable. The factory's hook body wraps `IncrementalTQCompressor` and applies it between forward passes as the R7-B canonical loop expects.
 
 This refactor is **out of R12 v1.0 docs scope** — it's a separate implementation PR — but R12's first execution sweep is blocked on it. Estimated effort: <1 surgeon session. After the refactor lands, the canonical sweep `b_mse ∈ {6,5,4,3,2,1}` becomes mechanically achievable; until then, the methodology is documented but unexecutable.
+
+**Empirical implementation cost (v1.1, cascaded from R-track sessions 2026-05-15 to 2026-05-16):** the prerequisite resolved as two PRs — parameterisation (PR #25, ~half session, merged) and round-trip factory (PR #26, ~full session, draft). A third workstream — Triton / `torch.compile` optimization survey plus β1a uniform-batched factory (PR #27, ~full session, draft) — emerged during the cascade as methodologically additive (see §8.2). The original `<1 surgeon session` estimate covered only the prerequisite and understated even that scope by approximately 2-3×; v1.1 surfaces this correction.
+
+### §8.2 Optimization path (cascaded from R-track session 2026-05-16)
+
+#### §8.2.1 Pure-Python baseline (γ)
+
+- **L-scaling characterisation**: per-hook wall-time follows `cost(L) ≈ 556 ms + 2.24 ms × L` for `L ≥ 512` on TinyLlama-1.1B dims (`n_layers=22, n_heads=32, head_dim=64`) on M4 Pro CPU. Below `L ≈ 300` the cost sits on a Python-overhead floor; above it the vector-math regime is linear in `L`.
+- **Full TinyLlama 6-point sweep**: integrating the per-call cost over the R7-B canonical loop (hook fires once per generated token, accumulating `O(L²)` per sequence) gives `~1.62 hr per 2048-token sequence`. At 16 sequences per sweep point and 6 sweep points, the full sweep is `~157 hr` wall time on pure-Python γ.
+- **Cold-cost reattribution**: the ~10-minute "cold" first-hook cost in PR #26 traces to `TurboQuantConfig.get_mixed_config`'s lazy outlier-channel detection per `(layer, head)` pair on first call, not to `compute_lloyd_max_codebook` as originally framed in PR #26's body. Under `mixed_precision=False` (β1a), this short-circuits to `~0 cold`.
+- **References**: per-hook latency at `L=8/32/64` (cold ~11 min, warm 620/645/699 ms) tabulated in PR #26 PR body; `L=256/512/1024/2048` measurements (1400/1719/2841/5140 ms warm) from the 2026-05-16 L-scaling probe (R-track session memory).
+- **Why this matters**: §8's original `~3 hr` estimate was a pre-empirical projection assuming `~700 ms` constant per-call cost across all `L`; the L-scaling probe falsified that constancy assumption above `L ≈ 300`, understating true pure-γ wall-time by ~52×. v1.0 carried the estimate as aspirational rather than measured.
+
+#### §8.2.2 Surveyed optimization paths
+
+| Option | Status | Wall-time (full 6-point sweep) | Engineering | Methodological integrity |
+|---|---|---|---|---|
+| α — Triton kernels | **DEAD** | n/a | n/a | n/a (math-incompatible) |
+| β1a — batched uniform | **LIVE** (PR #27) | ~26 hr | ~1.5 days | shift (no mixed precision) |
+| β1b — batched mixed | **DEFERRED** | ~22-32 hr (projected) | ~3-5 days | preserved |
+| β2 — `torch.compile` | **DEAD** | n/a (0.09× empirical) | n/a | n/a |
+| γ — pure-Python (mixed) | **FALLBACK** | ~157 hr | none | preserved |
+
+**α disqualification (dual)**: `turboquant/src/kernels.py` uses Rademacher (±1) QJL S matrices while `cache.py` uses Gaussian N(0,1) S matrices per the paper's Definition 1 (kernels.py lines 1-10 explicitly forbid mixing the two paths). Additionally, the Triton kernels assume CUDA per the self-test footer at `kernels.py:1268`; mainline Triton has no MPS backend in the installed environment.
+
+**β2 disqualification**: empirical probe (R-track 2026-05-16) measured `torch.compile(make_b_mse_hook, mode='reduce-overhead')` at `0.09×` speedup (i.e., ~11× SLOWDOWN). Dynamo log shows `config.recompile_limit (8)` hit on `get_mixed_config` due to `head_idx` integer-specialisation triggering a fresh trace per head; `torch.Generator.__new__` (used by QJL Rademacher sampling) also flagged as untraceable. The structural mismatch with the per-(layer, head) Python loop is not fixable without refactoring the loop itself; out of v1.1 scope.
+
+**β1b deferral**: methodologically preserves mixed precision via batched outlier-channel partitioning across pairs, at ~3-5 days engineering vs β1a's ~1.5 days. Not currently required given β1a + targeted γ-supplement strategy (§8.2.3) recovers mixed-precision PPL at deployment-relevant anchor points. Revisit if R12 sweep cadence increases or anchor-point coverage proves insufficient.
+
+#### §8.2.3 Recommended R12 sweep workflow (post-v1.1)
+
+**Primary headroom curve via β1a** (uniform precision):
+
+- Tool: `make_b_mse_hook_uniform` (`tools/tern_infer.py`, PR #27)
+- Coverage: full 6-point sweep `b_mse ∈ {6,5,4,3,2,1}` at uniform precision
+- Wall-time: `~26 hr` (linear fit on β1a measured costs: `cost(L) ≈ 0.464 ms × L`, integrated over 2048-token sequences × 16 sequences × 6 points)
+
+**Targeted mixed-precision anchors via γ**:
+
+- Tool: `make_b_mse_hook` (`tools/tern_infer.py`, PR #26)
+- Coverage: 2-3 deployment-relevant `b_mse` points (default: `b_mse ∈ {3, 4}` — the `b_mse=3` 12 May TQ bench legacy anchor + `b_mse=4` Excellent/Acceptable band boundary per §8 expected behaviour). Surgeon may override at runtime; document override in run `notes`.
+- Wall-time: `~26 hr per anchor point` (γ per-sequence ~1.62 hr × 16 sequences; see §8.2.1 for derivation). 2 anchors = ~52 hr supplement; 3 anchors = ~78 hr supplement.
+- Purpose: anchor the uniform-vs-mixed PPL delta empirically at deployment-relevant operating points.
+
+**Total R&D cycle**: `~78-104 hr` (β1a + 2-3 γ anchors) vs `~157 hr` pure-γ — wall-time savings of **33-50%** over running R12 entirely on the mixed-precision reference.
+
+**Cross-tabulation strategy**: at each anchor `b_mse` value, report both the β1a uniform PPL and the γ mixed-precision PPL. The cross-tabulation quantifies the outlier-channel-protection contribution to PPL at the sweep operating range. The uniform-precision headroom curve produced by β1a characterises a configuration that does not ship; the γ-supplement anchors recover the deployment-relevant numbers. Both datasets are required for the §7 operating-point selection to be deployment-meaningful.
+
+**Empirical reference data point** (captured during PR #27 Phase E verification): `cos(β1a uniform, cache.py mixed) = 0.9896`, `MSE = 2.01e-02` at `b_mse=4`, layer 0, head 0. This single data point bounds the methodological delta but does not substitute for the full anchor-point sweep — PPL behaviour is downstream of single-vector reconstruction quality and requires its own measurement.
+
+#### §8.2.4 Forward references
+
+- **PR #25** (merged) — `b_mse` parameterisation of `IncrementalTQCompressor`; commit `03fe4f6`
+- **PR #26** (draft) — `make_b_mse_hook` mixed-precision reference factory; head `227a675`
+- **PR #27** (draft) — `make_b_mse_hook_uniform` β1a optimization factory; head `4002edc`
+- **R7-B v1.1** (forthcoming) — hook-factory lifetime + per-call cost expectations; next queued workstream per session-end roadmap
+- **R-track session memory 2026-05-16** — empirical baseline measurements (Triton-on-MPS survey, L-scaling probe, `torch.compile` probe, β1a landing + Phase E numbers)
 
 ---
 
@@ -397,6 +454,28 @@ Ratification cascade applied per surgeon disposition. Two changes from v0.2:
 
 All other v0.2 content unchanged.
 
+### v1.0 → v1.1 cascade (2026-05-16) — empirical wall-time correction
+
+Cascade applied 2026-05-16 per surgeon ratification of empirical-probe disposition. All edits sourced from the 2026-05-16 R-track session: Triton-on-MPS survey, L-scaling probe, `torch.compile` probe, β1a landing (PR #27 Phase E). v1.0 retained verbatim in §1-§7 and §9-§10; §8/§8.1 amended; §8.2 new.
+
+#### Substantive (methodology-affecting)
+
+12. **§8 wall-time estimate referenced to §8.2 (empirical)**. v1.0 cited `~3 hr` as a pre-empirical projection assuming `~700 ms` constant per-call cost; the 2026-05-16 L-scaling probe falsified the constancy assumption above `L ≈ 300` (`cost(L) ≈ 556 ms + 2.24 ms × L`). The original `~3 hr` understated true β1a wall-time by ~9× and true pure-γ wall-time by ~52×. v1.1 grounds wall-time in measurement.
+13. **§8.1 scope correction surfaced (4 bullets understated by ~3×)**. Empirical resolution: parameterisation (PR #25, ~half session, merged) + round-trip factory (PR #26, ~full session, draft) as prerequisites, plus a third additive workstream — optimization survey + β1a (PR #27, ~full session, draft). Closing sentence added under v1.1; existing four bullets preserved as documentary record.
+14. **§8.2 (new) — optimization path with empirical findings.** Subsections:
+    - §8.2.1 pure-Python baseline (γ) — L-scaling characterisation, ~157 hr full sweep, cold-cost reattribution (`get_mixed_config` lazy outlier-detection, not codebook compute)
+    - §8.2.2 surveyed paths — α (DEAD), β1a (LIVE, PR #27), β1b (DEFERRED), β2 (DEAD), γ (FALLBACK); disqualification reasons tabled
+    - §8.2.3 recommended workflow — β1a primary + targeted γ-supplement; total R&D cycle `~78-104 hr` vs `~157 hr` pure-γ (33-50% savings)
+    - §8.2.4 forward references
+
+#### Documentary (clarity / accuracy without methodology change)
+
+15. **Footer revised** — v1.0 footer claimed "Implementation execution blocked on §8.1 refactor PR." This is stale: prerequisite PR #25 has merged, PR #26 is in draft, and §8.2 provides the first-execution strategy. v1.1 footer reflects the unblocked state.
+
+#### Banked lesson (methodology-adjacent)
+
+Pre-empirical wall-time projections in spec documents are aspirational, not anchors. v1.0's `~3 hr` (§8) and `<1 surgeon session` (§8.1) projections both understated true cost — former by ~9-52× depending on optimization path, latter by ~3×. Future spec drafts SHOULD label pre-empirical projections explicitly as such and SHOULD cite them as upper-bound hypotheses to be falsified during first execution, not as commitments.
+
 ---
 
-*Ratified 2026-05-15 — tern-core methodology document, R12 v1.0. Companion to R8 v1.1; together they resolve the R8 v1.0 conflation per `r8_v1.1_disposition_note.md`. Implementation execution blocked on §8.1 refactor PR.*
+*Ratified 2026-05-16 — tern-core methodology document, R12 v1.1. Companion to R8 v1.1. Implementation execution unblocked: §8.1 prerequisite resolved (PR #25 merged, PR #26 draft); first-execution strategy per §8.2 (β1a primary sweep + targeted γ-supplement anchors).*
