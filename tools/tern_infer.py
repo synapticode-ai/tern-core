@@ -30,6 +30,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from terncore.mixed_precision import MixedPrecisionConverter
 
+
+def _ensure_turboquant_on_path() -> None:
+    """Resolve turboquant's source directory and add it to sys.path.
+
+    Background: turboquant 0.1.0 has an upstream packaging bug. Its setup.py
+    uses find_packages() which discovered the src/ directory as a top-level
+    package literally named 'src'. As a result, ``from turboquant.cache import
+    ...`` fails (ModuleNotFoundError: No module named 'turboquant') even
+    though pip metadata reports turboquant 0.1.0 installed. The working
+    import is ``from src.cache import ...`` after sys.path is augmented with
+    the parent of the src/ directory.
+
+    Discovery order:
+      1. ``TURBOQUANT_DEV_PATH`` environment variable (if set + path exists)
+      2. Repo-relative fallback: ``<tern-core-root>/../venv/src/turboquant``
+      3. Raise ImportError with diagnostic message
+
+    Future work: when upstream turboquant lands ``package_dir={"turboquant":
+    "src"}, packages=["turboquant"]`` (or migrates to a pyproject.toml-based
+    src layout), this helper can be removed and replaced with direct ``from
+    turboquant.cache import ...`` imports across all consumer sites. Tracked
+    as carry-forward; not in scope for this fix.
+    """
+    import os
+
+    candidates: list[tuple[str, Path]] = []
+    env_path = os.environ.get("TURBOQUANT_DEV_PATH")
+    if env_path:
+        candidates.append(("TURBOQUANT_DEV_PATH env-var", Path(env_path)))
+
+    # Repo-relative fallback: this file is tern-core/tools/tern_infer.py;
+    # canonical dev-box layout is sibling venv at ../venv/src/turboquant.
+    repo_root = Path(__file__).resolve().parent.parent  # tern-core/
+    fallback = repo_root.parent / "venv" / "src" / "turboquant"
+    candidates.append(("repo-relative ../venv/src/turboquant", fallback))
+
+    for label, path in candidates:
+        if path.is_dir() and (path / "src" / "cache.py").is_file():
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+            return
+
+    searched = "\n".join(f"  - {label}: {p}" for label, p in candidates)
+    raise ImportError(
+        "turboquant package path not resolvable; searched:\n"
+        f"{searched}\n"
+        "Set TURBOQUANT_DEV_PATH env-var to override, or ensure the "
+        "repo-relative venv/src/turboquant layout is present."
+    )
+
+
 DEFAULT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DEFAULT_MAX_TOKENS = 50
 
@@ -153,7 +205,7 @@ class IncrementalTQCompressor:
     """
 
     def __init__(self, n_layers: int, n_heads: int, head_dim: int, device="cpu", b_mse: int = 3):
-        sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
+        _ensure_turboquant_on_path()
         from src.cache import TurboQuantConfig
 
         self.n_layers = n_layers
@@ -251,7 +303,7 @@ def make_b_mse_hook(
         Callable[(past_key_values) -> past_key_values] suitable for direct
         injection as kv_cache_hook in R7-B v1.0 §5 autoregressive_ppl.
     """
-    sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
+    _ensure_turboquant_on_path()
     from src.cache import (
         TurboQuantConfig,
         turboquant_encode_internal,
@@ -341,7 +393,7 @@ def make_b_mse_hook_uniform(
     import math
     import torch.nn.functional as F
 
-    sys.path.insert(0, "/Users/syn/synapticode/venv/src/turboquant")
+    _ensure_turboquant_on_path()
     from src.cache import TurboQuantConfig, fwht_inplace, EPS
 
     config = TurboQuantConfig(
