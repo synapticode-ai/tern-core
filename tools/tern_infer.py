@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from transformers.cache_utils import DynamicCache
 
 # Ensure tern-core is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -348,7 +349,7 @@ def make_b_mse_hook(
                 new_k[:, head_idx] = k_recon.reshape(batch, seq_len, hd).to(k.dtype)
                 new_v[:, head_idx] = v_recon.reshape(batch, seq_len, hd).to(v.dtype)
             new_past.append((new_k, new_v))
-        return tuple(new_past)
+        return DynamicCache(tuple(new_past))
 
     return hook
 
@@ -502,11 +503,11 @@ def make_b_mse_hook_uniform(
         k_out_all = k_recon.reshape(n_layers, n_heads, batch, seq_len, d).permute(0, 2, 1, 3, 4)
         v_out_all = v_recon.reshape(n_layers, n_heads, batch, seq_len, d).permute(0, 2, 1, 3, 4)
 
-        return tuple(
+        return DynamicCache(tuple(
             (k_out_all[l].contiguous().to(kv_pairs[l][0].dtype),
              v_out_all[l].contiguous().to(kv_pairs[l][1].dtype))
             for l in range(n_layers)
-        )
+        ))
 
     return hook
 

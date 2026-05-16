@@ -323,25 +323,11 @@ def evaluate_ppl_autoregressive(
                     use_cache=True,
                 )
                 past_kv = outputs.past_key_values
+                # Per R7-B v1.1 §5.2: kv_cache_hook returns DynamicCache
+                # directly. The legacy-tuple wrapping bridge from PR #30 is
+                # removed; the hook factories (PR #26, PR #27) now produce
+                # Cache-shaped objects natively.
                 past_kv = kv_cache_hook(past_kv)
-                # HF Cache-shape shim: PR #26 / PR #27 hooks return legacy
-                # tuple-of-tuples per R7-B v1.1 §5.2 docstring; current HF
-                # transformers (>= 5.x) requires Cache objects with
-                # .get_seq_length() at modeling_<arch>.py forward path.
-                # Bridge the spec's "return past_key_values" contract with
-                # HF's evolving shape via DynamicCache wrap when needed.
-                if past_kv is not None and not hasattr(past_kv, "get_seq_length"):
-                    try:
-                        from transformers.cache_utils import DynamicCache
-
-                        past_kv = DynamicCache(past_kv)
-                    except (ImportError, AttributeError, TypeError, ValueError):
-                        # Older transformers may accept tuple natively; or
-                        # synthetic-stub tests may pass non-tensor markers
-                        # that DynamicCache cannot validate. Pass through —
-                        # the next forward call will either accept or raise
-                        # meaningfully against its own expectations.
-                        pass
 
                 logits = outputs.logits[0, -1]
                 target = torch.tensor(seq[t + 1], device=device)

@@ -163,8 +163,9 @@ def make_b_mse_hook(b_mse: int):
     """R12 compression hook factory."""
     def hook(past_kv):
         # Iterate (K, V) tensor pairs per layer; apply IncrementalTQCompressor
-        # at the configured b_mse parameter; return updated past_kv.
+        # at the configured b_mse parameter; wrap result in DynamicCache.
         ...
+        return DynamicCache(tuple(new_past))  # HF >= 5.x Cache contract
     return hook
 
 # Usage in R12 sweep:
@@ -174,7 +175,9 @@ for b_mse_value in [1, 2, 3, 4, 5, 6]:
     # record sum_loss / n per sweep point
 ```
 
-The hook receives the full `past_key_values` tuple-of-tuples (HF format: outer tuple over layers, inner tuple of (K, V)). The compression operator may mutate or replace tensors; the returned object must be a valid `past_key_values` for the next forward call.
+The hook receives `past_key_values` from the previous forward call and must return a `transformers.cache_utils.DynamicCache` instance compatible with HF transformers ≥5.x. This contract supersedes the legacy tuple-of-tuples format from HF transformers <5.x — the canonical R7-B harness path assumes Cache objects with `.get_seq_length()` per HF's evolved Cache interface.
+
+The factory builds its modified KV state internally (typically as a tuple-of-(K, V) sequence during construction for compatibility with the underlying turboquant primitives) and wraps the result in `DynamicCache(...)` before returning, providing a single canonical return shape across all R-track hook factories. Bench-harness code calling the hook receives the DynamicCache directly and passes it as-is to the next forward call; no shape bridging is required at the call site.
 
 *v1.1: a batched-uniform-precision variant `make_b_mse_hook_uniform` exists for sweep-time optimization; see §5.4 and R12 v1.1 §8.2.*
 
@@ -359,6 +362,17 @@ Per-model baselines are NOT optional: R12 cannot legitimately compute `ppl_headr
 ---
 
 ## §11 Change log
+
+### v1.1 §5.2 disambiguation (2026-05-17) — DynamicCache return contract specified
+
+In-place disambiguation under v1.1. Spec version stays at v1.1; schema version stays at `wikitext2_ppl_autoregressive/1.0`. No methodology change.
+
+§5.2 was ambiguous about hook return shape across HF transformers <5.x (legacy tuple-of-tuples) and ≥5.x (Cache objects). PR #26 and PR #27 factories returned legacy tuples; the bench harness in PR #30 bridged the gap via a defensive `DynamicCache(past_kv)` wrap with bare except for synthetic-stub tolerance. This disambiguation:
+
+- §5.2 now explicitly specifies the DynamicCache return contract per HF transformers ≥5.x
+- Both hook factories (`make_b_mse_hook`, `make_b_mse_hook_uniform`) wrap their internal tuple-of-(K, V) state in `DynamicCache(...)` at the return statement
+- The PR #30 harness shim is removed; the call site now assumes DynamicCache and passes through unchanged
+- Failure mode improves: a future hook bug returning a legacy tuple raises at the HF forward call with a specific Cache-shape error rather than being silently absorbed by the shim
 
 ### v1.0 → v1.1 cascade (2026-05-16) — hook lifetime + empirical cost expectations
 
