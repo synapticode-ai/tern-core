@@ -58,7 +58,7 @@ import tern_ppl_bench  # noqa: E402
 
 SCHEMA_VERSION_POINT = "ppl_headroom_kv_cache_point/1.0"
 SCHEMA_VERSION_SWEEP = "ppl_headroom_kv_cache_sweep/1.0"
-SPEC_VERSION = "kv_cache_compression_ppl_headroom_diagnostic v1.1"
+SPEC_VERSION = "kv_cache_compression_ppl_headroom_diagnostic v1.2"
 METHODOLOGY_CONSUMED = "wikitext2_ppl_methodology_autoregressive v1.2"
 
 
