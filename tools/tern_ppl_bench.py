@@ -58,10 +58,10 @@ DEFAULT_SEQ_LEN = 2048
 DEFAULT_STRIDE = 2048
 DEFAULT_ROLLING_STRIDE = 1024  # R7-A §5 diagnostic rolling-window variant
 
-# ── R7-B v1.1 §7 schema constants ──────────────────────────────────────
+# ── R7-B v1.2 §7 schema constants ──────────────────────────────────────
 
 SCHEMA_VERSION_AR = "wikitext2_ppl_autoregressive/1.0"
-SPEC_VERSION_AR = "wikitext2_ppl_methodology_autoregressive v1.1"
+SPEC_VERSION_AR = "wikitext2_ppl_methodology_autoregressive v1.2"
 DEFAULT_NUM_SEQUENCES = 16   # R7-B v1.0 §4 canonical N
 DEFAULT_AR_SEQ_LEN = 2048    # R7-B v1.0 §4 canonical L (matches R7-A seq_len)
 
@@ -922,7 +922,7 @@ def main() -> None:
             / "wikitext2_ppl_autoregressive"
         )
 
-    methodology_tag = "R7-A v1.0" if methodology == "sliding" else "R7-B v1.1"
+    methodology_tag = "R7-A v1.0" if methodology == "sliding" else "R7-B v1.2"
     print(f"[tern_ppl_bench] {methodology_tag} — variant={variant}")
     t_load = time.perf_counter()
 
@@ -1041,7 +1041,7 @@ def main() -> None:
     # ── R7-B v1.1 §5 autoregressive eval ────────────────────────────
     print(
         f"[tern_ppl_bench]   eval: N={args.num_sequences}, L={args.ar_seq_len} "
-        f"(R7-B v1.1 §4 — non-overlapping, BOS-per-sequence={bos_prepended})"
+        f"(R7-B v1.2 §4 — non-overlapping, BOS-per-sequence={bos_prepended})"
     )
     sequences = build_sequences_autoregressive(
         tokens=tokens,
