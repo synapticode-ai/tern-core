@@ -1,6 +1,6 @@
-# KV-Cache-Compression PPL Headroom Diagnostic Methodology — R12 v1.0
+# KV-Cache-Compression PPL Headroom Diagnostic Methodology — R12 v1.2
 
-**Document status:** v1.0 (ratified 2026-05-15) — promoted from v0.2 with §10 local-path-strip cleanup. v0.1 and v0.2 drafts retained at `ecc-ternary/uploads/R12_KV_CACHE_DIAGNOSTIC_SPEC_DRAFT_20260515T022418Z/` as historical record. Full change inventory at §11.
+**Document status:** v1.2 (ratified 2026-05-18) — promoted from v1.1 with §6.1 `kv_cache_compression_ratio` semantics clarification per the A'' R12 sweep wrapper workstream carry-forward. v0.1 and v0.2 drafts retained at `ecc-ternary/uploads/R12_KV_CACHE_DIAGNOSTIC_SPEC_DRAFT_20260515T022418Z/` as historical record. Full change inventory at §11.
 **Authored:** 2026-05-15
 **Repository path (on ratification):** `tern-core/docs/kv_cache_compression_ppl_headroom_diagnostic.md`
 **Companion documents:**
@@ -108,13 +108,13 @@ For each `b_mse` value in the sweep grid:
 
 1. **Load** source FP16 model + tokenizer per R7-B v1.0 §3 (shared with R7-A v1.0 §3 — same conventions).
 2. **Construct** the KV-cache compression hook via `make_b_mse_hook(b_mse=<sweep_point>)` per R7-B v1.0 §5.2 (factory to be authored per §8.1 implementation prerequisite).
-3. **Evaluate PPL** per R7-B v1.0 methodology using `tools/tern_kv_ppl_bench.py` (to be authored as the R12-conformant tool, analogous to `tools/tern_ppl_bench.py` for R7-A). The hook is injected into `autoregressive_ppl(..., kv_cache_hook=hook)` per R7-B v1.0 §5 canonical loop. Tokeniser resolves per R7-B v1.0 §3.
+3. **Evaluate PPL** per R7-B v1.0 methodology using `tools/tern_r12_sweep.py` (to be authored as the R12-conformant tool, analogous to `tools/tern_ppl_bench.py` for R7-A). The hook is injected into `autoregressive_ppl(..., kv_cache_hook=hook)` per R7-B v1.0 §5 canonical loop. Tokeniser resolves per R7-B v1.0 §3.
 4. **Compute `ppl_headroom`** against the cached `baseline_ppl_r7b`:
    ```
    ppl_headroom = (ppl_kv_compressed - baseline_ppl_r7b) / baseline_ppl_r7b
    ```
-   (Computed inside `tern_kv_ppl_bench.py` when `--baseline-ppl` and `--baseline-run-id` are passed; the diagnostic consumes it.)
-5. **Compute `kv_cache_compression_ratio`** externally — `IncrementalTQCompressor` does not natively surface this metric (verified 2026-05-15 against `tools/tern_infer.py:148`). `tern_kv_ppl_bench.py` measures `past_key_values` byte-size pre-hook and post-hook for the same forward call, then reports the ratio per the §6.1 schema field.
+   (Computed inside `tern_r12_sweep.py` when `--baseline-ppl` and `--baseline-run-id` are passed; the diagnostic consumes it.)
+5. **Compute `kv_cache_compression_ratio`** externally — `IncrementalTQCompressor` does not natively surface this metric (verified 2026-05-15 against `tools/tern_infer.py:148`). `tern_r12_sweep.py` measures `past_key_values` byte-size pre-hook and post-hook for the same forward call, then reports the ratio per the §6.1 schema field.
 6. **Record the point** in the sweep manifest (per §6 schema).
 7. **Early-termination check:** if `ppl_headroom > ppl_headroom_ceiling` at the current `b_mse`, mark `terminated_at_ceiling=true`; continue or stop per §5.
 
@@ -136,7 +136,7 @@ The sweep terminates when ANY of:
 1. **Ceiling crossed:** `ppl_headroom > ppl_headroom_ceiling` at the current `b_mse`. Mark `sweep.terminated_reason="ceiling_crossed"`.
 2. **Grid exhausted:** All `b_mse` values in the sweep grid have been evaluated. Mark `sweep.terminated_reason="grid_exhausted"`.
 3. **Hook construction failure:** `make_b_mse_hook` fails at an extreme `b_mse` value (e.g. `b_mse=0` or below the implementation's supported floor). Mark `sweep.terminated_reason="hook_construction_failure"` with `failed_at_b_mse` recorded.
-4. **PPL eval failure:** `tern_kv_ppl_bench.py` fails (OOM at unexpected KV-cache scale on large models, model-load failure, numerical instability in the cache compressor, etc.). Mark `sweep.terminated_reason="ppl_eval_failure"` with `failed_at_b_mse` recorded.
+4. **PPL eval failure:** `tern_r12_sweep.py` fails (OOM at unexpected KV-cache scale on large models, model-load failure, numerical instability in the cache compressor, etc.). Mark `sweep.terminated_reason="ppl_eval_failure"` with `failed_at_b_mse` recorded.
 
 **Continue-past-ceiling mode (diagnostic):** For research-mode runs that want frontier characterisation BEYOND the operating ceiling (e.g. mapping the marginal/fail bands per R7-A §7 threshold bands inherited by R7-B and R12), the sweep MAY continue past `ppl_headroom_ceiling` if `continue_past_ceiling=true` is set. The recommended-operating-point selection (§7) still respects the original ceiling.
 
@@ -166,7 +166,7 @@ The diagnostic emits TWO classes of JSON output:
   "ppl_kv_compressed": "float",
   "ppl_headroom": "float (4 sig fig)",
   "ppl_headroom_band": "Excellent | Acceptable | Marginal | Fail",
-  "kv_cache_compression_ratio": "float (size_before / size_after, computed by tern_kv_ppl_bench.py from pre/post past_key_values byte sizes; IncrementalTQCompressor does NOT natively surface this — see §10 reference and §8.1 implementation prerequisite)",
+  "kv_cache_compression_ratio": "float (size_before / size_after, computed by tern_r12_sweep.py from pre/post past_key_values byte sizes; IncrementalTQCompressor does NOT natively surface this — see §10 reference and §8.1 implementation prerequisite for round-trip-hook semantics clarification per v1.2)",
   "terminated_at_ceiling": "bool",
   "hook_construction_failed": "bool",
   "notes": "string"
@@ -174,6 +174,18 @@ The diagnostic emits TWO classes of JSON output:
 ```
 
 Filename: `point_<NN>_b_mse_<B>_<timestamp>.json` (e.g. `point_03_b_mse_3_2026-05-15T040000Z.json`).
+
+**`kv_cache_compression_ratio` semantics (v1.2 clarification):**
+
+The `kv_cache_compression_ratio` field's computation method depends on the KV-cache hook's architecture:
+
+- **Round-trip hooks** (e.g., `make_b_mse_hook_uniform` / β1a): hooks that encode → quantize → decode within the closure, returning a `DynamicCache` with the same shape and dtype as the input. The output bytes equal the input bytes; "compression" lives in the codebook-encoded intermediate representation that never propagates outside the hook. For these hooks, `kv_cache_compression_ratio` is computed **theoretically** from the codebook encoding: `(baseline_bits_per_coord) / b_mse`. For FP16 baseline, this is `16 / b_mse` (e.g., b_mse=4 → 4.0× compression; b_mse=2 → 8.0×; b_mse=1 → 16.0×).
+
+- **Propagation hooks** (not yet implemented in tern-core): hooks where compressed K/V state propagates through subsequent model forward calls without intermediate decoding. For these hooks, `kv_cache_compression_ratio` is measured from pre-hook vs post-hook `past_key_values` byte sizes (or equivalent compressed-state size representations), per the original schema description.
+
+When a round-trip hook emits a theoretically-derived ratio, the per-point JSON's `notes` field should explicitly document the derivation method and reference this §6.1 clarification.
+
+*v1.1: the field's pre/post-bytes computation note was authored before β1a's round-trip design was finalized; under that hook architecture, the literal mechanism produces 1.0 (vacuous). v1.2 clarifies the semantics for both hook architectures; the field's intent — characterizing the operating point's compression for downstream comparison — is preserved.*
 
 ### §6.2 Aggregate sweep manifest (one per diagnostic run)
 
@@ -184,8 +196,8 @@ Filename: `point_<NN>_b_mse_<B>_<timestamp>.json` (e.g. `point_03_b_mse_3_2026-0
   "timestamp_utc": "ISO 8601",
   "tern_core_version": "string",
   "tern_core_git_commit": "string (10-char sha)",
-  "spec_version": "kv_cache_compression_ppl_headroom_diagnostic v1.0",
-  "methodology_consumed": "wikitext2_ppl_methodology_autoregressive v1.0",
+  "spec_version": "kv_cache_compression_ppl_headroom_diagnostic v1.2",
+  "methodology_consumed": "wikitext2_ppl_methodology_autoregressive v1.2",
 
   "inputs": {
     "source_model": "string",
@@ -411,24 +423,55 @@ Architecture sweep runs SHOULD reuse the v1.0 sweep grid where possible to permi
 - `docs/r8_v1.1_disposition_note.md` (PR #20) — disposition record ratifying option (c) split into R8 v1.1 + R12
 - `docs/wikitext2_ppl_methodology.md` (R7-A v1.0, PR #20) — teacher-forcing PPL methodology; sibling to R7-B but explicitly NOT R12-conformant per R7-B §1.2
 - `benchmarks/tq_bench_results.json` (2026-03-30, `b_mse=3` 5-sentence anchor) — preserved as documentary record; retired by R7-B v1.0 §1.2; R12 v1.0 first execution re-establishes the anchor under R7-B-conformant methodology
-- `tools/tern_kv_ppl_bench.py` (to be authored alongside R12 v1.0 ratification) — R12-conformant PPL + KV-cache-compression measurement tool, analogous to `tools/tern_ppl_bench.py` for R7-A
+- `tools/tern_r12_sweep.py` (to be authored alongside R12 v1.0 ratification) — R12-conformant PPL + KV-cache-compression measurement tool, analogous to `tools/tern_ppl_bench.py` for R7-A
 - `IncrementalTQCompressor` (tern-core adapter at `tools/tern_infer.py:148`; wraps third-party TurboQuant package) — KV-cache compression operator that R12 will consume via R7-B v1.0 §5.2's planned `make_b_mse_hook` factory. Current state: `b_mse` hardcoded at line 162 inside the `TurboQuantConfig` call; parameterisation refactor per §8.1 is the implementation prerequisite.
 - `tools/tern_infer.py:62` — adjacent `MixedPrecisionConverter.convert(...).report.compression_ratio` surfacing pattern; weight-compression code path (NOT KV-cache); cited here so the cross-reference is unambiguous and future readers don't conflate the two ratio-surfacing patterns.
 - `docs/backlog.md` R13 entry — `ppl_headroom` terminology disambiguation between autoscan-internal sense and R7-A/R8/R12 outcome metric (R12 inherits R8's outcome-metric sense unchanged)
 
 ---
 
-## §11 Change log — v0.1 → v0.2 (2026-05-15)
+## §11 Change log
+
+### v1.1 → v1.2 cascade (2026-05-18) — §6.1 kv_cache_compression_ratio semantics clarification
+
+Cascade applied 2026-05-18 per surgeon ratification. Carry-forward from A'' R12 sweep wrapper workstream (PR #34, 2026-05-17): the sweep wrapper implementation surfaced that R12 v1.1 §6.1's `kv_cache_compression_ratio` field was vacuous under the β1a `make_b_mse_hook_uniform` hook architecture.
+
+β1a is a round-trip hook: input FP16 K/V → encode → quantize → decode → output FP16 K/V at identical shape and dtype. The output bytes equal the input bytes; the schema's described mechanism ("computed by `tern_r12_sweep.py` from pre/post `past_key_values` byte sizes") would always emit 1.0 — actively misleading because the operating point's actual compression (4×, 8×, 16× depending on `b_mse`) lives in the codebook-encoded intermediate representation that never propagates outside the hook.
+
+v1.2 clarification disambiguates the field semantics for two hook architectures:
+
+- **Round-trip hooks**: compute theoretically from codebook parameters (`16 / b_mse` for FP16 baseline)
+- **Propagation hooks** (not yet implemented in tern-core): measure from pre/post byte sizes as originally described
+
+PR #34's sweep wrapper implementation already emitted the theoretical ratio with explanatory notes during its initial design — v1.2 spec catches up with the implementation reality discovered during workstream execution.
+
+No schema-level changes (`ppl_headroom_kv_cache_point/1.0` and `ppl_headroom_kv_cache_sweep/1.0` both remain at `/1.0`); the field-semantics note is documentation-only. Spec version bumps v1.1 → v1.2; the `spec_version` field emitted by `tern_r12_sweep.py` updates accordingly via PR #34's companion amendment.
+
+Doc-consistency sweep folded in (parallel to yesterday's R7-B v1.2 precedent):
+- Front matter title + Document status bumped v1.0 → v1.2 directly (folds the v1.1 hygiene lag from the v1.0 → v1.1 cascade)
+- §7 schema example `spec_version` and `methodology_consumed` bumped to v1.2 (parallels R7-B v1.2 §7 fix)
+- §11 heading refactored to `## §11 Change log` + per-cascade `###` sub-entries (newest-first) per the R7-B convention; v0.1 → v0.2 cascade content demoted to a `### v0.1 → v0.2 cascade` sub-entry with internal `####` sub-sub-sections
+- Tool-name divergence: §4 / §6.1 / §10 references to the anticipated `tern_kv_ppl_bench.py` updated to the actual artifact `tern_r12_sweep.py` (5 live references in spec text); historical mentions in §11 v0.1 → v0.2 cascade preserved verbatim as documentary record of what v0.2 spec actually said
+- Footer rewritten to v1.2 ratification with §6.1 clarification + doc-consistency sweep mention
+
+**Cross-references:**
+- A'' workstream: PR #34 (sweep wrapper implementation)
+- β1a factory: PR #27 (`make_b_mse_hook_uniform`)
+- Cache-shape contract: PR #32 (`DynamicCache` return)
+- R7-B v1.2 doc-consistency sweep precedent: PR #33 (yesterday)
+- Running sweep at session-launch (PID 8767, 2026-05-17): emits `spec_version: kv_cache_compression_ppl_headroom_diagnostic v1.1` because launched before this v1.2 clarification landed; methodologically correct (sweep WAS executed under v1.1 understanding; implementation already emitted v1.2-conformant theoretical ratios with explanatory notes)
+
+### v0.1 → v0.2 cascade (2026-05-15)
 
 Cascade applied 2026-05-15 per surgeon ratification of v0.1 leans. All edits sourced from the verification + corruption-fix pass landed earlier the same day. v0.1 retained alongside this file as `kv_cache_compression_ppl_headroom_diagnostic.md`.
 
-### Substantive (methodology-affecting)
+#### Substantive (methodology-affecting)
 
 1. **Eagle Bracket attribution broadened from 3-only to 2+3** (§1 last paragraph + §9 cross-architecture-frontier feeds). v0.1 cited only Bracket 3 (constant per-token encode at scale). v0.2 adds Bracket 2 (deployment-tier selection — per-tier `b_mse` choices for memory/quality tradeoffs) since R12's per-architecture frontier is directly consumed by tier selection. Q2 from v0.1 SURGEON_BRIEF.
 2. **§8 post-execution gate 3 softened** — v0.1 required `recommended_operating_point` non-null AND `b_mse <= 4`. v0.2 keeps the non-null requirement but removes the `b_mse <= 4` floor; pre-execution it would anchor on the 12 May TQ bench shape (non-R7-B-conformant) — tighten in v1.1 once first-execution data lands. Q from v0.1 SURGEON_BRIEF.
 3. **§8.1 new section** — implementation prerequisite for `b_mse` parameterisation. Discovered during the verification pass: `IncrementalTQCompressor` currently hardcodes `b_mse=3` at `tools/tern_infer.py:162`; the `make_b_mse_hook` factory per R7-B v1.0 §5.2 does not yet exist on the class. R12 first execution is blocked on a small refactor PR (estimated <1 surgeon session). Spec is documented but unexecutable until that refactor lands.
 
-### Documentary (clarity / accuracy without methodology change)
+#### Documentary (clarity / accuracy without methodology change)
 
 4. **§3 added explicit IncrementalTQCompressor hardcoding callout** — mid-section pointer to §8.1 prerequisite so any reader reaching the sweep-parameter discussion sees the blocker before getting to §8.
 5. **§3.3 new v0.2-simplification disclaimer** — explicit one-paragraph note that v0.2 holds multiple dimensions fixed for signal-attribution cleanliness; v2.0 proposes joint sweeps + per-layer selectivity. Q3 from v0.1 SURGEON_BRIEF.
@@ -437,7 +480,7 @@ Cascade applied 2026-05-15 per surgeon ratification of v0.1 leans. All edits sou
 8. **§10 IncrementalTQCompressor reference fixed** — v0.1 said `(tern-core internal) — surfaced via R7-B v1.0 §5.2 make_b_mse_hook factory`. v0.2 cites the concrete path `tools/tern_infer.py:148`, identifies it as an adapter wrapping third-party TurboQuant, and explicitly flags the `b_mse` hardcoding state at line 162 + the §8.1 refactor prerequisite. Q5 from v0.1 SURGEON_BRIEF.
 9. **§10 added `tools/tern_infer.py:62` adjacent-pattern reference** — disambiguates the weight-compression `report.compression_ratio` surfacing at the file's earlier line from the KV-cache scope, so future readers don't conflate the two patterns when scanning the file.
 
-### Unchanged from v0.1 (deliberate; surgeon may revisit in v0.3 if desired)
+#### Unchanged from v0.1 (deliberate; surgeon may revisit in v0.3 if desired)
 
 - **Q1 sweep direction** — descending `b_mse` (highest first). Keeps R8 v1.1's "lowest aggression to highest" convention. v0.1 lean confirmed.
 - All schema versions (`ppl_headroom_kv_cache_point/1.0`, `ppl_headroom_kv_cache_sweep/1.0`) — decoupled from spec version per R7-A/R7-B/R8 v1.1 precedent.
@@ -478,4 +521,4 @@ Pre-empirical wall-time projections in spec documents are aspirational, not anch
 
 ---
 
-*Ratified 2026-05-16 — tern-core methodology document, R12 v1.1. Companion to R8 v1.1. Implementation execution unblocked: §8.1 prerequisite resolved (PR #25 merged, PR #26 draft); first-execution strategy per §8.2 (β1a primary sweep + targeted γ-supplement anchors).*
+*Ratified 2026-05-18 — tern-core methodology document, R12 v1.2. Companion to R8 v1.1, consumed by R7-B v1.2 autoregressive PPL methodology. v1.1 unblocked implementation execution (§8.1 prerequisite resolved via PR #25/#26; first-execution strategy per §8.2). v1.2 clarifies §6.1 `kv_cache_compression_ratio` semantics for round-trip vs propagation hook architectures (PR #34 A'' workstream carry-forward), plus a doc-consistency sweep (front matter v1.0 → v1.2, §7 example version stamps, §11 newest-first restructure, tool-name divergence resolution).*
