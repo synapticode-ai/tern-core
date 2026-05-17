@@ -461,6 +461,37 @@ Doc-consistency sweep folded in (parallel to yesterday's R7-B v1.2 precedent):
 - R7-B v1.2 doc-consistency sweep precedent: PR #33 (yesterday)
 - Running sweep at session-launch (PID 8767, 2026-05-17): emits `spec_version: kv_cache_compression_ppl_headroom_diagnostic v1.1` because launched before this v1.2 clarification landed; methodologically correct (sweep WAS executed under v1.1 understanding; implementation already emitted v1.2-conformant theoretical ratios with explanatory notes)
 
+### v1.0 → v1.1 cascade (2026-05-16) — empirical wall-time correction
+
+Cascade applied 2026-05-16 per surgeon ratification of empirical-probe disposition. All edits sourced from the 2026-05-16 R-track session: Triton-on-MPS survey, L-scaling probe, `torch.compile` probe, β1a landing (PR #27 Phase E). v1.0 retained verbatim in §1-§7 and §9-§10; §8/§8.1 amended; §8.2 new.
+
+#### Substantive (methodology-affecting)
+
+12. **§8 wall-time estimate referenced to §8.2 (empirical)**. v1.0 cited `~3 hr` as a pre-empirical projection assuming `~700 ms` constant per-call cost; the 2026-05-16 L-scaling probe falsified the constancy assumption above `L ≈ 300` (`cost(L) ≈ 556 ms + 2.24 ms × L`). The original `~3 hr` understated true β1a wall-time by ~9× and true pure-γ wall-time by ~52×. v1.1 grounds wall-time in measurement.
+13. **§8.1 scope correction surfaced (4 bullets understated by ~3×)**. Empirical resolution: parameterisation (PR #25, ~half session, merged) + round-trip factory (PR #26, ~full session, draft) as prerequisites, plus a third additive workstream — optimization survey + β1a (PR #27, ~full session, draft). Closing sentence added under v1.1; existing four bullets preserved as documentary record.
+14. **§8.2 (new) — optimization path with empirical findings.** Subsections:
+    - §8.2.1 pure-Python baseline (γ) — L-scaling characterisation, ~157 hr full sweep, cold-cost reattribution (`get_mixed_config` lazy outlier-detection, not codebook compute)
+    - §8.2.2 surveyed paths — α (DEAD), β1a (LIVE, PR #27), β1b (DEFERRED), β2 (DEAD), γ (FALLBACK); disqualification reasons tabled
+    - §8.2.3 recommended workflow — β1a primary + targeted γ-supplement; total R&D cycle `~78-104 hr` vs `~157 hr` pure-γ (33-50% savings)
+    - §8.2.4 forward references
+
+#### Documentary (clarity / accuracy without methodology change)
+
+15. **Footer revised** — v1.0 footer claimed "Implementation execution blocked on §8.1 refactor PR." This is stale: prerequisite PR #25 has merged, PR #26 is in draft, and §8.2 provides the first-execution strategy. v1.1 footer reflects the unblocked state.
+
+#### Banked lesson (methodology-adjacent)
+
+Pre-empirical wall-time projections in spec documents are aspirational, not anchors. v1.0's `~3 hr` (§8) and `<1 surgeon session` (§8.1) projections both understated true cost — former by ~9-52× depending on optimization path, latter by ~3×. Future spec drafts SHOULD label pre-empirical projections explicitly as such and SHOULD cite them as upper-bound hypotheses to be falsified during first execution, not as commitments.
+
+### v0.2 → v1.0 promotion (2026-05-15)
+
+Ratification cascade applied per surgeon disposition. Two changes from v0.2:
+
+10. **§10 local-path strip** — v0.2 cited the TurboQuant install location as a surgeon-local venv path (environment-brittle and not useful as repo documentation). v1.0 strips the path; the file:line reference at `tools/tern_infer.py:148` remains as the canonical adapter location.
+11. **Version-string sweep** — all `v0.2` references in §1 through §10 and the footer rewritten to `v1.0`; §11 historical references to the v0.1 → v0.2 cascade preserved verbatim as documentary record. §3.3 line about "during v0.2 review" rephrased to "Future cascade revisions (v1.x or v2.0) may promote..." since v1.0 is now the ratified state.
+
+All other v0.2 content unchanged.
+
 ### v0.1 → v0.2 cascade (2026-05-15)
 
 Cascade applied 2026-05-15 per surgeon ratification of v0.1 leans. All edits sourced from the verification + corruption-fix pass landed earlier the same day. v0.1 retained alongside this file as `kv_cache_compression_ppl_headroom_diagnostic.md`.
@@ -487,37 +518,6 @@ Cascade applied 2026-05-15 per surgeon ratification of v0.1 leans. All edits sou
 - Canonical sweep range `b_mse ∈ {6,5,4,3,2,1}` — bracketing the 12 May anchor; adjustable per model family.
 - §7 operating-point selection rule + tiebreakers — unchanged.
 - §9 architecture coverage table — unchanged.
-
-### v0.2 → v1.0 promotion (2026-05-15)
-
-Ratification cascade applied per surgeon disposition. Two changes from v0.2:
-
-10. **§10 local-path strip** — v0.2 cited the TurboQuant install location as a surgeon-local venv path (environment-brittle and not useful as repo documentation). v1.0 strips the path; the file:line reference at `tools/tern_infer.py:148` remains as the canonical adapter location.
-11. **Version-string sweep** — all `v0.2` references in §1 through §10 and the footer rewritten to `v1.0`; §11 historical references to the v0.1 → v0.2 cascade preserved verbatim as documentary record. §3.3 line about "during v0.2 review" rephrased to "Future cascade revisions (v1.x or v2.0) may promote..." since v1.0 is now the ratified state.
-
-All other v0.2 content unchanged.
-
-### v1.0 → v1.1 cascade (2026-05-16) — empirical wall-time correction
-
-Cascade applied 2026-05-16 per surgeon ratification of empirical-probe disposition. All edits sourced from the 2026-05-16 R-track session: Triton-on-MPS survey, L-scaling probe, `torch.compile` probe, β1a landing (PR #27 Phase E). v1.0 retained verbatim in §1-§7 and §9-§10; §8/§8.1 amended; §8.2 new.
-
-#### Substantive (methodology-affecting)
-
-12. **§8 wall-time estimate referenced to §8.2 (empirical)**. v1.0 cited `~3 hr` as a pre-empirical projection assuming `~700 ms` constant per-call cost; the 2026-05-16 L-scaling probe falsified the constancy assumption above `L ≈ 300` (`cost(L) ≈ 556 ms + 2.24 ms × L`). The original `~3 hr` understated true β1a wall-time by ~9× and true pure-γ wall-time by ~52×. v1.1 grounds wall-time in measurement.
-13. **§8.1 scope correction surfaced (4 bullets understated by ~3×)**. Empirical resolution: parameterisation (PR #25, ~half session, merged) + round-trip factory (PR #26, ~full session, draft) as prerequisites, plus a third additive workstream — optimization survey + β1a (PR #27, ~full session, draft). Closing sentence added under v1.1; existing four bullets preserved as documentary record.
-14. **§8.2 (new) — optimization path with empirical findings.** Subsections:
-    - §8.2.1 pure-Python baseline (γ) — L-scaling characterisation, ~157 hr full sweep, cold-cost reattribution (`get_mixed_config` lazy outlier-detection, not codebook compute)
-    - §8.2.2 surveyed paths — α (DEAD), β1a (LIVE, PR #27), β1b (DEFERRED), β2 (DEAD), γ (FALLBACK); disqualification reasons tabled
-    - §8.2.3 recommended workflow — β1a primary + targeted γ-supplement; total R&D cycle `~78-104 hr` vs `~157 hr` pure-γ (33-50% savings)
-    - §8.2.4 forward references
-
-#### Documentary (clarity / accuracy without methodology change)
-
-15. **Footer revised** — v1.0 footer claimed "Implementation execution blocked on §8.1 refactor PR." This is stale: prerequisite PR #25 has merged, PR #26 is in draft, and §8.2 provides the first-execution strategy. v1.1 footer reflects the unblocked state.
-
-#### Banked lesson (methodology-adjacent)
-
-Pre-empirical wall-time projections in spec documents are aspirational, not anchors. v1.0's `~3 hr` (§8) and `<1 surgeon session` (§8.1) projections both understated true cost — former by ~9-52× depending on optimization path, latter by ~3×. Future spec drafts SHOULD label pre-empirical projections explicitly as such and SHOULD cite them as upper-bound hypotheses to be falsified during first execution, not as commitments.
 
 ---
 
