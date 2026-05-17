@@ -437,9 +437,27 @@ def _tern_core_version() -> str:
 
 
 def run_sweep(args: argparse.Namespace) -> SweepResult:
-    """Main sweep orchestration: load model once, loop over b_mse points."""
-    diagnostic_run_id = str(uuid.uuid4())
-    sweep_dir_name = f"sweep_{tern_ppl_bench.utc_now_compact()}_{diagnostic_run_id[:8]}"
+    """Main sweep orchestration: load model once, loop over b_mse points.
+
+    Optional argparse overrides (per-point process-split orchestrator support,
+    additive 2026-05-18):
+      args.diagnostic_run_id    — reuse a caller-minted run_id (default: mint)
+      args.output_subdir        — reuse a caller-minted sweep subdir name
+                                  (default: sweep_<UTC>_<runid8>)
+      args.point_index_offset   — absolute point-index for the first b_mse in
+                                  this invocation's grid (default: 0). Per-point
+                                  invocations pass the absolute sweep index so
+                                  per-point JSON filenames carry the correct
+                                  absolute index across separated subprocesses.
+    """
+    diagnostic_run_id = (
+        getattr(args, "diagnostic_run_id", None) or str(uuid.uuid4())
+    )
+    sweep_dir_name = (
+        getattr(args, "output_subdir", None)
+        or f"sweep_{tern_ppl_bench.utc_now_compact()}_{diagnostic_run_id[:8]}"
+    )
+    point_index_offset = getattr(args, "point_index_offset", 0) or 0
     output_dir = Path(args.output_dir) / sweep_dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -498,7 +516,8 @@ def run_sweep(args: argparse.Namespace) -> SweepResult:
     failed_at_b_mse: Optional[int] = None
     total_eval_wall = 0.0
 
-    for idx, b_mse in enumerate(b_mse_values):
+    for local_idx, b_mse in enumerate(b_mse_values):
+        idx = local_idx + point_index_offset
         print(f"\n[r12_sweep] === point {idx} (b_mse={b_mse}) ===", flush=True)
         point_t0 = time.perf_counter()
         point_result = run_sweep_point(
@@ -622,6 +641,21 @@ def main() -> None:
     parser.add_argument("--notes", default="")
     parser.add_argument("--smoke", action="store_true",
                         help="Reduced-param smoke mode: b_mse=[4,2], N=2, L=128")
+    # Per-point process-split orchestrator support (additive 2026-05-18)
+    parser.add_argument("--diagnostic-run-id", default=None,
+                        help="Reuse a caller-minted diagnostic_run_id (uuid4); "
+                             "default = mint per invocation")
+    parser.add_argument("--output-subdir", default=None,
+                        help="Reuse a caller-minted sweep subdir name under "
+                             "--output-dir; default = sweep_<UTC>_<runid8>")
+    parser.add_argument("--skip-manifest", action="store_true",
+                        help="Skip writing sweep_manifest.json (per-point "
+                             "invocation; orchestrator aggregates post-loop)")
+    parser.add_argument("--point-index-offset", type=int, default=0,
+                        help="Absolute point-index for the first b_mse in this "
+                             "invocation's grid (default 0). Used by the "
+                             "per-point orchestrator so filenames carry the "
+                             "correct absolute index across subprocesses.")
 
     args = parser.parse_args()
 
@@ -638,6 +672,18 @@ def main() -> None:
         )
 
     sweep_result = run_sweep(args)
+
+    if args.skip_manifest:
+        print(
+            f"\n[r12_sweep] === POINT(S) COMPLETE (manifest skipped per "
+            f"--skip-manifest) ===\n"
+            f"[r12_sweep] termination: {sweep_result.termination_reason}\n"
+            f"[r12_sweep] points completed: "
+            f"{len(sweep_result.point_results)}\n"
+            f"[r12_sweep] output_dir: {sweep_result.output_dir}",
+            flush=True,
+        )
+        return
 
     # Build + write aggregate manifest
     b_mse_list = [int(x.strip()) for x in args.b_mse_values.split(",") if x.strip()]
